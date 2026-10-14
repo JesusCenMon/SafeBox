@@ -8,7 +8,7 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from tkinter import Canvas, messagebox
+from tkinter import Canvas
 
 import cv2
 import customtkinter as ctk
@@ -21,20 +21,20 @@ from core import MAX_DISTANCE, SafeBackend, detector
 BASE = Path(__file__).resolve().parent
 SAMPLES_REQUIRED = 20
 
-BG = "#070D18"
-SURFACE = "#0E192B"
-SURFACE_2 = "#14243A"
-BORDER = "#203651"
-TEXT = "#F0F7FF"
-MUTED = "#A6BBD1"
-CYAN = "#52E4EC"
-BLUE = "#5B9CFF"
-RED = "#FF667F"
-AMBER = "#FFC985"
+BG = "#121212"
+SURFACE = "#181818"
+SURFACE_2 = "#252525"
+BORDER = "#383838"
+TEXT = "#FFFFFF"
+MUTED = "#B3B3B3"
+CYAN = "#1ED760"
+BLUE = "#539DF5"
+RED = "#F3727F"
+AMBER = "#FFA42B"
 
 STATE_COLORS = {
     "INICIANDO": BLUE,
-    "ESCANEANDO": CYAN,
+    "ESCANEANDO": MUTED,
     "VERIFICANDO": BLUE,
     "REGISTRANDO": BLUE,
     "AUTORIZADO": CYAN,
@@ -55,7 +55,7 @@ class SafeApp(ctk.CTk):
         super().__init__(fg_color=BG)
         self.title("SAFEBOX AI · Dashboard biométrico")
         self.geometry("1220x720+40+30")
-        self.minsize(1060, 670)
+        self.minsize(980, 650)
 
         self.backend = SafeBackend(data_dir, mode, port)
         self.mode = mode
@@ -63,7 +63,11 @@ class SafeApp(ctk.CTk):
         self.camera_connected = False
         self.backend_ready = False
         self.known_users: list[str] = []
+        self.people: list[tuple[str, str]] = []
         self.history_rows: list[tuple] = []
+        self.history_results: list[tuple] = []
+        self.history_offset = 0
+        self.current_page = "Inicio"
         self.boxes: list[tuple[int, int, int, int]] = []
         self.last_frame_seq = 0
         self.status_state = ""
@@ -76,6 +80,8 @@ class SafeApp(ctk.CTk):
         self.register_window: ctk.CTkToplevel | None = None
         self.photo = None
         self.photo_size = None
+        self.preview_photo = None
+        self.search_job = None
 
         self.build_ui()
         self.refresh_history()
@@ -89,27 +95,48 @@ class SafeApp(ctk.CTk):
     def card(parent, radius: int = 16) -> ctk.CTkFrame:
         return ctk.CTkFrame(
             parent, fg_color=SURFACE, corner_radius=radius,
-            border_width=1, border_color=BORDER,
         )
 
     def build_ui(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
+        navigation = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0, width=210)
+        navigation.grid(row=0, column=0, rowspan=3, sticky="nsew")
+        navigation.grid_propagate(False)
+        ctk.CTkLabel(navigation, text="◈  SAFEBOX AI", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 20, "bold")).pack(
+            anchor="w", padx=20, pady=(29, 6))
+        ctk.CTkLabel(navigation, text="CONTROL BIOMÉTRICO", text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=22, pady=(0, 34))
+        self.nav_buttons = {}
+        for label, glyph in (("Inicio", "⌂"), ("Escáner", "◎"),
+                             ("Usuarios", "♙"), ("Historial", "▤"),
+                             ("Configuración", "⚙")):
+            button = ctk.CTkButton(
+                navigation, text=f"{glyph}   {label}", anchor="w", height=43,
+                corner_radius=22, fg_color="transparent", hover_color=SURFACE_2,
+                text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13, "bold"),
+                command=lambda page=label: self.navigate(page),
+            )
+            button.pack(fill="x", padx=13, pady=3)
+            self.nav_buttons[label] = button
+        ctk.CTkLabel(navigation, text="DATOS LOCALES · SAFEBOX", text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 10)).pack(
+            side="bottom", anchor="w", padx=22, pady=22)
+
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=28, pady=(18, 16))
+        header.grid(row=0, column=1, sticky="ew", padx=24, pady=(18, 16))
         header.grid_columnconfigure(0, weight=1)
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(brand, text="◈", text_color=CYAN,
-                     font=ctk.CTkFont("Segoe UI Symbol", 31)).pack(side="left", padx=(0, 11))
-        ctk.CTkLabel(brand, text="SAFEBOX", text_color=TEXT,
-                     font=ctk.CTkFont("Segoe UI", 28, "bold")).pack(side="left")
-        ctk.CTkLabel(brand, text=" AI", text_color=CYAN,
-                     font=ctk.CTkFont("Segoe UI", 28, "bold")).pack(side="left")
-        ctk.CTkLabel(header, text="CENTRO DE CONTROL BIOMÉTRICO", text_color=MUTED,
+        self.page_title = ctk.CTkLabel(brand, text="Panel de control", text_color=TEXT,
+                                       font=ctk.CTkFont("Segoe UI", 27, "bold"))
+        self.page_title.pack(side="left")
+        ctk.CTkLabel(header, text="SAFEBOX AI  /  ACCESO BIOMÉTRICO", text_color=MUTED,
                      font=ctk.CTkFont("Segoe UI", 10, "bold")).grid(
-            row=1, column=0, sticky="w", padx=46, pady=(0, 0)
+            row=1, column=0, sticky="w", pady=(0, 0)
         )
         header_right = ctk.CTkFrame(header, fg_color="transparent")
         header_right.grid(row=0, column=1, rowspan=2, sticky="e")
@@ -117,13 +144,17 @@ class SafeApp(ctk.CTk):
                                         font=ctk.CTkFont("Consolas", 12))
         self.clock_label.pack(side="left", padx=(0, 18))
         self.clock_label.configure(text=datetime.now().strftime("%H:%M:%S"))
-        mode_label = "SIMULACIÓN ACTIVA" if self.mode == "simulacion" else "SERIAL ACTIVO"
-        ctk.CTkLabel(header_right, text=f"●  {mode_label}", text_color=CYAN,
-                     fg_color=SURFACE_2, corner_radius=9, width=164, height=34,
-                     font=ctk.CTkFont("Segoe UI", 10, "bold")).pack(side="left")
+        mode_label = "SIMULACIÓN" if self.mode == "simulacion" else "HARDWARE · INICIANDO"
+        self.mode_badge = ctk.CTkLabel(
+            header_right, text=f"●  {mode_label}",
+            text_color=MUTED if self.mode == "simulacion" else AMBER,
+            fg_color=SURFACE_2, corner_radius=18, width=164, height=34,
+            font=ctk.CTkFont("Segoe UI", 10, "bold"))
+        self.mode_badge.pack(side="left")
 
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="nsew", padx=28, pady=(0, 14))
+        body.grid(row=1, column=1, sticky="nsew", padx=24, pady=(0, 14))
+        self.dashboard_body = body
         body.grid_columnconfigure(0, weight=7)
         body.grid_columnconfigure(1, weight=4, minsize=355)
         body.grid_rowconfigure(0, weight=1)
@@ -141,7 +172,7 @@ class SafeApp(ctk.CTk):
                                          font=ctk.CTkFont("Segoe UI", 10, "bold"))
         self.camera_badge.grid(row=0, column=1, sticky="e")
 
-        self.camera_canvas = Canvas(camera_card, bg="#081321", highlightthickness=0,
+        self.camera_canvas = Canvas(camera_card, bg="#101010", highlightthickness=0,
                                     relief="flat", bd=0)
         self.camera_canvas.grid(row=1, column=0, sticky="nsew", padx=18)
         self.camera_canvas.bind("<Configure>", self.on_camera_resize)
@@ -171,16 +202,22 @@ class SafeApp(ctk.CTk):
         self.faces_label = ctk.CTkLabel(camera_foot, text="ROSTROS DETECTADOS  00",
                                         text_color=MUTED, font=ctk.CTkFont("Consolas", 10))
         self.faces_label.grid(row=0, column=0, sticky="w")
+        self.scan_result = ctk.CTkLabel(camera_foot, text="Esperando cámara", text_color=MUTED,
+                                        font=ctk.CTkFont("Segoe UI", 11, "bold"))
+        self.scan_result.grid(row=0, column=1, sticky="e", padx=12)
         self.retry_button = ctk.CTkButton(
             camera_foot, text="Reintentar cámara", width=128, height=28,
-            fg_color=SURFACE_2, hover_color=BORDER, text_color=CYAN,
+            fg_color=SURFACE_2, hover_color=BORDER, text_color=TEXT,
+            corner_radius=18,
             font=ctk.CTkFont("Segoe UI", 10, "bold"), command=self.open_camera,
         )
-        self.retry_button.grid(row=0, column=1, sticky="e")
+        self.retry_button.grid(row=0, column=2, sticky="e")
         self.retry_button.grid_remove()
 
         side = ctk.CTkFrame(body, fg_color="transparent")
         side.grid(row=0, column=1, sticky="nsew")
+        self.dashboard_side = side
+        self.camera_card = camera_card
         side.grid_columnconfigure(0, weight=1)
         side.grid_rowconfigure(2, weight=1)
 
@@ -246,14 +283,15 @@ class SafeApp(ctk.CTk):
 
         self.register_button = ctk.CTkButton(
             side, text="+  Registrar nuevo usuario", height=43,
-            fg_color=CYAN, hover_color="#37C6D3", text_color=BG,
+            fg_color=CYAN, hover_color="#1DB954", text_color=BG,
+            corner_radius=22,
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             command=self.open_registration,
         )
         self.register_button.grid(row=3, column=0, sticky="ew", pady=(12, 0))
 
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=2, column=0, sticky="ew", padx=28, pady=(0, 13))
+        footer.grid(row=2, column=1, sticky="ew", padx=24, pady=(0, 13))
         footer.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(footer, text="SAFEBOX AI  /  RECONOCIMIENTO LOCAL  /  DATOS EN ESTE EQUIPO",
                      text_color=MUTED, font=ctk.CTkFont("Consolas", 9)).grid(
@@ -263,6 +301,279 @@ class SafeApp(ctk.CTk):
                                         font=ctk.CTkFont("Consolas", 9))
         self.users_count.grid(row=0, column=1, sticky="e")
         self.update_user_count()
+        self.notice_label = ctk.CTkLabel(footer, text="", text_color=AMBER,
+                                         font=ctk.CTkFont("Segoe UI", 10))
+        self.notice_label.grid(row=1, column=0, columnspan=2, sticky="w")
+        self.build_secondary_pages()
+        self.navigate("Inicio")
+
+    def build_secondary_pages(self) -> None:
+        self.pages = {}
+        for title, heading, subtitle in (
+            ("Usuarios", "Identidades autorizadas", "Gestiona los rostros registrados en este equipo"),
+            ("Historial", "Registro de accesos", "Consulta los intentos guardados localmente"),
+            ("Configuración", "Estado operativo", "Cámara, reconocimiento y modo de conexión"),
+        ):
+            page = ctk.CTkFrame(self, fg_color="transparent")
+            page.grid(row=1, column=1, sticky="nsew", padx=24, pady=(0, 14))
+            page.grid_columnconfigure(0, weight=1)
+            page.grid_rowconfigure(2, weight=1)
+            ctk.CTkLabel(page, text=heading, text_color=TEXT,
+                         font=ctk.CTkFont("Segoe UI", 28, "bold")).grid(
+                row=0, column=0, sticky="w", pady=(3, 0))
+            ctk.CTkLabel(page, text=subtitle, text_color=MUTED,
+                         font=ctk.CTkFont("Segoe UI", 12)).grid(
+                row=1, column=0, sticky="w", pady=(0, 20))
+            self.pages[title] = page
+            page.grid_remove()
+
+        users = self.pages["Usuarios"]
+        users_card = self.card(users)
+        users_card.grid(row=2, column=0, sticky="nsew")
+        users_card.grid_columnconfigure(0, weight=1)
+        users_card.grid_rowconfigure(1, weight=1)
+        users_head = ctk.CTkFrame(users_card, fg_color="transparent")
+        users_head.grid(row=0, column=0, sticky="ew", padx=22, pady=(20, 8))
+        users_head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(users_head, text="Personas registradas", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 17, "bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(users_head, text="+  Registrar rostro", width=170, height=38,
+                      corner_radius=20, fg_color=CYAN, hover_color="#1DB954",
+                      text_color=BG, command=self.open_registration).grid(row=0, column=1)
+        self.users_list = ctk.CTkScrollableFrame(users_card, fg_color="transparent")
+        self.users_list.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 16))
+        self.refresh_users()
+
+        history = self.pages["Historial"]
+        filters = self.card(history)
+        filters.grid(row=2, column=0, sticky="nsew")
+        filters.grid_columnconfigure(0, weight=1)
+        filters.grid_rowconfigure(2, weight=1)
+        search_row = ctk.CTkFrame(filters, fg_color="transparent")
+        search_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 12))
+        search_row.grid_columnconfigure(0, weight=1)
+        self.history_search = ctk.CTkEntry(
+            search_row, placeholder_text="Buscar usuario…", height=40,
+            corner_radius=20, fg_color=SURFACE_2, border_width=0, text_color=TEXT)
+        self.history_search.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.history_search.bind("<KeyRelease>", self.schedule_history_search)
+        self.history_filter = ctk.CTkOptionMenu(
+            search_row, values=["Todos", "AUTORIZADO", "DENEGADO"],
+            width=155, height=40, corner_radius=20, fg_color=SURFACE_2,
+            button_color=BORDER, button_hover_color="#505050",
+            text_color=TEXT, command=lambda _: self.reset_history_search())
+        self.history_filter.grid(row=0, column=1)
+        self.history_note = ctk.CTkLabel(
+            filters, text="Cargando historial…", text_color=MUTED,
+            font=ctk.CTkFont("Segoe UI", 11))
+        self.history_note.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 8))
+        self.history_full_list = ctk.CTkScrollableFrame(filters, fg_color="transparent")
+        self.history_full_list.grid(row=2, column=0, sticky="nsew", padx=17, pady=(0, 16))
+        pager = ctk.CTkFrame(filters, fg_color="transparent")
+        pager.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 16))
+        self.history_prev = ctk.CTkButton(pager, text="Anterior", width=95, height=30,
+                                           corner_radius=16, fg_color=SURFACE_2,
+                                           hover_color=BORDER, command=lambda: self.change_history_page(-1))
+        self.history_prev.pack(side="left", padx=(0, 8))
+        self.history_next = ctk.CTkButton(pager, text="Siguiente", width=95, height=30,
+                                           corner_radius=16, fg_color=SURFACE_2,
+                                           hover_color=BORDER, command=lambda: self.change_history_page(1))
+        self.history_next.pack(side="left")
+
+        settings = self.pages["Configuración"]
+        settings_card = self.card(settings)
+        settings_card.grid(row=2, column=0, sticky="nsew")
+        settings_card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(settings_card, text="Conexiones y datos", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 18, "bold")).grid(
+            row=0, column=0, sticky="w", padx=24, pady=(16, 8))
+        self.settings_camera = self.setting_line(settings_card, 1, "Cámara", "Iniciando…")
+        self.settings_engine = self.setting_line(settings_card, 2, "Reconocimiento", "Iniciando…")
+        self.setting_line(settings_card, 3, "Modelo facial", "OpenCV LBPH · local")
+        mode_text = "Simulación · sin hardware conectado" if self.mode == "simulacion" else f"Hardware · {self.backend.port}"
+        self.setting_line(settings_card, 4, "Modo", mode_text)
+        self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
+        ctk.CTkButton(settings_card, text="Reintentar cámara", width=170,
+                      height=38, corner_radius=20, fg_color=SURFACE_2,
+                      hover_color=BORDER, text_color=TEXT,
+                      command=self.open_camera).grid(row=6, column=0, sticky="w", padx=24, pady=(12, 8))
+        ctk.CTkLabel(settings_card,
+                     text="Los comandos WeMos solo se envían al iniciar con --mode hardware --port COMx.",
+                     text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
+                     wraplength=650, justify="left").grid(
+            row=7, column=0, sticky="w", padx=24, pady=(0, 14))
+
+    @staticmethod
+    def setting_line(parent, row: int, title: str, value: str) -> ctk.CTkLabel:
+        line = ctk.CTkFrame(parent, fg_color=SURFACE_2, corner_radius=10)
+        line.grid(row=row, column=0, sticky="ew", padx=24, pady=4)
+        line.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(line, text=title, text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 12)).grid(
+            row=0, column=0, sticky="w", padx=16, pady=8)
+        label = ctk.CTkLabel(line, text=value, text_color=TEXT,
+                             font=ctk.CTkFont("Segoe UI", 12, "bold"),
+                             wraplength=450, justify="right")
+        label.grid(row=0, column=1, sticky="e", padx=16, pady=8)
+        return label
+
+    def navigate(self, page: str) -> None:
+        self.current_page = page
+        self.page_title.configure(text="Panel de control" if page == "Inicio" else page)
+        for name, button in self.nav_buttons.items():
+            active = name == page
+            button.configure(fg_color=SURFACE_2 if active else "transparent",
+                             text_color=TEXT if active else MUTED)
+        for frame in self.pages.values():
+            frame.grid_remove()
+        if page in {"Inicio", "Escáner"}:
+            self.dashboard_body.grid()
+            if page == "Escáner":
+                self.dashboard_side.grid_remove()
+                self.dashboard_body.grid_columnconfigure(0, weight=1)
+                self.dashboard_body.grid_columnconfigure(1, weight=0, minsize=0)
+            else:
+                self.dashboard_side.grid()
+                self.dashboard_body.grid_columnconfigure(0, weight=7)
+                self.dashboard_body.grid_columnconfigure(1, weight=4, minsize=355)
+        else:
+            self.dashboard_body.grid_remove()
+            self.pages[page].grid()
+            if page == "Usuarios":
+                self.backend.send("list_users")
+            elif page == "Historial":
+                self.request_history()
+
+    def refresh_users(self) -> None:
+        for child in self.users_list.winfo_children():
+            child.destroy()
+        if not self.people:
+            ctk.CTkLabel(self.users_list,
+                         text="Aún no hay identidades. Registra el primer rostro para empezar.",
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
+                anchor="w", padx=12, pady=24)
+            return
+        for person_id, name in self.people:
+            item = ctk.CTkFrame(self.users_list, fg_color=SURFACE_2, corner_radius=12)
+            item.pack(fill="x", pady=5)
+            item.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(item, text=f"●  {name}", text_color=TEXT,
+                         font=ctk.CTkFont("Segoe UI", 13, "bold")).grid(
+                row=0, column=0, sticky="w", padx=18, pady=16)
+            ctk.CTkButton(item, text="Eliminar", width=95, height=32,
+                          corner_radius=17, fg_color="#423035", hover_color="#653B44",
+                          text_color=RED, command=lambda uid=person_id, label=name:
+                          self.confirm_delete(uid, label)).grid(row=0, column=1, padx=14)
+
+    def confirm_delete(self, person_id: str, name: str) -> None:
+        window = ctk.CTkToplevel(self, fg_color=BG)
+        window.title("SAFEBOX AI · Confirmar eliminación")
+        window.geometry("420x210")
+        window.resizable(False, False)
+        window.transient(self)
+        window.grab_set()
+        ctk.CTkLabel(window, text="Eliminar identidad", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 21, "bold")).pack(
+            anchor="w", padx=25, pady=(24, 5))
+        ctk.CTkLabel(window, text=f"Se eliminarán las muestras de {name}. Esta acción no se puede deshacer.",
+                     text_color=MUTED, wraplength=365, justify="left",
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(
+            anchor="w", padx=25, pady=(0, 22))
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.pack(fill="x", padx=25)
+        ctk.CTkButton(actions, text="Cancelar", width=125, height=38,
+                      corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=window.destroy).pack(side="left")
+        def remove() -> None:
+            self.backend.send("delete_user", person_id)
+            window.destroy()
+        ctk.CTkButton(actions, text="Eliminar", width=125, height=38,
+                      corner_radius=20, fg_color="#883F4D", hover_color="#A54A5B",
+                      command=remove).pack(side="right")
+
+    def notify(self, message: str, error: bool = False) -> None:
+        self.notice_label.configure(text=message, text_color=RED if error else CYAN)
+        self.after(5000, lambda: self.notice_label.configure(text="") if self.running else None)
+
+    def schedule_history_search(self, _event=None) -> None:
+        if self.search_job is not None:
+            self.after_cancel(self.search_job)
+        self.search_job = self.after(250, self.reset_history_search)
+
+    def reset_history_search(self) -> None:
+        self.history_offset = 0
+        self.request_history()
+
+    def change_history_page(self, direction: int) -> None:
+        self.history_offset = max(0, self.history_offset + direction * 30)
+        self.request_history()
+
+    def request_history(self) -> None:
+        self.search_job = None
+        if self.backend_ready:
+            self.history_note.configure(text="Buscando…")
+            self.backend.send("search_history", (
+                self.history_search.get().strip(), self.history_filter.get(), self.history_offset))
+
+    def refresh_full_history(self) -> None:
+        for child in self.history_full_list.winfo_children():
+            child.destroy()
+        rows = self.history_results[:30]
+        self.history_note.configure(text=f"Intentos {self.history_offset + 1}–{self.history_offset + len(rows)}"
+                                    if rows else "Sin resultados")
+        self.history_prev.configure(state="normal" if self.history_offset else "disabled")
+        self.history_next.configure(state="normal" if len(self.history_results) > 30 else "disabled")
+        if not rows:
+            ctk.CTkLabel(self.history_full_list,
+                         text="No hay intentos que coincidan con la búsqueda.",
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
+                anchor="w", padx=10, pady=22)
+            return
+        for date, user, result, distance, capture in rows:
+            item = ctk.CTkFrame(self.history_full_list, fg_color=SURFACE_2, corner_radius=12)
+            item.pack(fill="x", pady=4)
+            item.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(item, text=user, text_color=TEXT,
+                         font=ctk.CTkFont("Segoe UI", 12, "bold")).grid(
+                row=0, column=0, sticky="w", padx=16, pady=(9, 0))
+            color = CYAN if result == "AUTORIZADO" else RED
+            ctk.CTkLabel(item, text=result, text_color=color,
+                         font=ctk.CTkFont("Segoe UI", 11, "bold")).grid(
+                row=0, column=1, sticky="e", padx=12, pady=(9, 0))
+            metric = f" · LBPH {distance:.1f}" if distance is not None else ""
+            ctk.CTkLabel(item, text=date[:19].replace("T", "  ") + metric,
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
+                row=1, column=0, sticky="w", padx=16, pady=(0, 9))
+            if capture:
+                ctk.CTkButton(item, text="Ver captura", width=100, height=27,
+                              corner_radius=14, fg_color=BORDER, hover_color="#555555",
+                              text_color=TEXT,
+                              command=lambda filename=capture: self.show_capture(filename)).grid(
+                    row=1, column=1, padx=12, pady=(0, 8))
+
+    def show_capture(self, filename: str) -> None:
+        path = self.backend.data_dir / "capturas" / filename
+        if path.name != filename or not path.is_file():
+            self.notify("La captura ya no existe.", error=True)
+            return
+        window = ctk.CTkToplevel(self, fg_color=BG)
+        window.title("SAFEBOX AI · Captura")
+        window.geometry("720x570")
+        window.transient(self)
+        ctk.CTkLabel(window, text=filename, text_color=MUTED,
+                     font=ctk.CTkFont("Segoe UI", 12)).pack(pady=(18, 10))
+        try:
+            with Image.open(path) as source:
+                picture = source.copy()
+            picture.thumbnail((680, 480))
+            photo = ctk.CTkImage(light_image=picture, dark_image=picture,
+                                 size=picture.size)
+            label = ctk.CTkLabel(window, text="", image=photo)
+            label.image = photo
+            label.pack(expand=True)
+        except (OSError, ValueError) as exc:
+            window.destroy()
+            self.notify(f"No se pudo abrir la captura: {exc}", error=True)
 
     @staticmethod
     def device_label(parent, title: str, initial: str) -> ctk.CTkLabel:
@@ -352,6 +663,10 @@ class SafeApp(ctk.CTk):
         self.identity_title.configure(text=title)
         self.detail_label.configure(text=detail)
         self.distance_label.configure(text=f"{distance:.1f}" if distance is not None else "—")
+        scan_text = f"{state} · {user}" if user != "—" else state
+        if distance is not None:
+            scan_text += f" · LBPH {distance:.1f}"
+        self.scan_result.configure(text=scan_text, text_color=color)
         unlocked = state == "AUTORIZADO"
         self.lock_value.configure(text="DESBLOQUEADA" if unlocked else "BLOQUEADA",
                                   text_color=CYAN if unlocked else TEXT)
@@ -382,7 +697,8 @@ class SafeApp(ctk.CTk):
         )
         self.register_entry = ctk.CTkEntry(
             window, placeholder_text="Nombre del usuario", height=43,
-            fg_color=SURFACE, border_color=BORDER, text_color=TEXT,
+            fg_color=SURFACE_2, border_color=BORDER, text_color=TEXT,
+            corner_radius=22,
         )
         self.register_entry.grid(row=2, column=0, sticky="ew", padx=28, pady=(23, 15))
         self.enrollment_progress = ctk.CTkProgressBar(
@@ -400,10 +716,12 @@ class SafeApp(ctk.CTk):
         actions.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(actions, text="Cancelar", height=39, fg_color=SURFACE_2,
                       hover_color=BORDER, text_color=TEXT,
+                      corner_radius=20,
                       command=self.cancel_enrollment).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.capture_button = ctk.CTkButton(
             actions, text="Iniciar captura", height=39,
-            fg_color=CYAN, hover_color="#37C6D3", text_color=BG,
+            fg_color=CYAN, hover_color="#1DB954", text_color=BG,
+            corner_radius=20,
             font=ctk.CTkFont("Segoe UI", 11, "bold"),
             command=self.start_enrollment,
         )
@@ -413,23 +731,18 @@ class SafeApp(ctk.CTk):
     def start_enrollment(self) -> None:
         name = self.register_entry.get().strip()
         if not re.fullmatch(r"[\w .-]{2,40}", name, flags=re.UNICODE):
-            messagebox.showwarning(
-                "Nombre inválido", "Usa entre 2 y 40 letras, números, espacios, puntos o guiones.",
-                parent=self.register_window,
-            )
+            self.enrollment_hint.configure(text="Usa 2 a 40 letras, números, espacios, puntos o guiones.", text_color=RED)
             return
         if not self.backend_ready:
-            messagebox.showinfo("Cargando", "El motor facial aún está iniciando.",
-                                parent=self.register_window)
+            self.enrollment_hint.configure(text="El motor facial aún está iniciando.", text_color=AMBER)
             return
         if any(existing.casefold() == name.casefold() for existing in self.known_users):
-            messagebox.showwarning("Nombre repetido", "Ese nombre ya está registrado.",
-                                   parent=self.register_window)
+            self.enrollment_hint.configure(text="Ese nombre ya está registrado.", text_color=RED)
             return
         if not self.camera_connected:
-            messagebox.showerror("Cámara", "No se pudo abrir la cámara.",
-                                 parent=self.register_window)
+            self.enrollment_hint.configure(text="La cámara no está disponible.", text_color=RED)
             return
+        self.enrollment_hint.configure(text="Preparando captura…", text_color=MUTED)
         self.capture_button.configure(state="disabled", text="Preparando…")
         self.register_entry.configure(state="disabled")
         self.backend.send("start_enroll", name)
@@ -490,20 +803,29 @@ class SafeApp(ctk.CTk):
                 self.backend_ready = True
                 self.known_users = event[1]
                 self.history_rows = event[2]
+                self.people = event[3]
                 self.update_user_count()
                 self.refresh_history()
+                self.refresh_users()
+                self.settings_engine.configure(text="Listo · LBPH activo", text_color=CYAN)
+                if self.mode == "hardware":
+                    self.mode_badge.configure(text="●  HARDWARE CONECTADO", text_color=CYAN)
+                if self.current_page == "Historial":
+                    self.request_history()
                 if self.camera_connected:
                     self.set_state("ESCANEANDO", "Esperando un rostro frente a la cámara")
             elif kind == "camera":
                 self.camera_connected = event[1]
                 if self.camera_connected:
                     self.camera_badge.configure(text="●  EN VIVO", text_color=CYAN)
+                    self.settings_camera.configure(text="Conectada", text_color=CYAN)
                     self.retry_button.grid_remove()
                     self.camera_canvas.delete("placeholder")
                     if self.backend_ready:
                         self.set_state("ESCANEANDO", "Esperando un rostro frente a la cámara")
                 else:
                     self.camera_badge.configure(text="●  SIN SEÑAL", text_color=AMBER)
+                    self.settings_camera.configure(text="Desconectada", text_color=AMBER)
                     self.retry_button.grid()
                     self.camera_canvas.itemconfigure(self.image_item, image="")
                     self.photo = None
@@ -522,6 +844,25 @@ class SafeApp(ctk.CTk):
             elif kind == "history":
                 self.history_rows = event[1]
                 self.refresh_history()
+                if self.current_page == "Historial":
+                    self.request_history()
+            elif kind == "history_search":
+                if (event[1], event[2], event[3]) == (self.history_search.get().strip(),
+                                                     self.history_filter.get(), self.history_offset):
+                    self.history_results = event[4]
+                    if self.current_page == "Historial":
+                        self.refresh_full_history()
+            elif kind == "users":
+                self.people = event[1]
+                self.refresh_users()
+            elif kind == "user_deleted":
+                self.people = event[2]
+                self.known_users = [name for _, name in self.people]
+                self.update_user_count()
+                self.refresh_users()
+                self.notify(f"Se eliminó a {event[1]} y se actualizó el modelo.")
+            elif kind == "user_error":
+                self.notify(event[1], error=True)
             elif kind == "enroll_started":
                 if self.register_window is not None and self.register_window.winfo_exists():
                     self.capture_button.configure(text="Capturando…")
@@ -533,22 +874,27 @@ class SafeApp(ctk.CTk):
             elif kind == "enroll_done":
                 self.known_users = event[2]
                 self.update_user_count()
+                self.backend.send("list_users")
+                self.notify(f"{event[1]} registrado correctamente.")
                 if self.register_window is not None and self.register_window.winfo_exists():
                     self.enrollment_hint.configure(text=f"{event[1]} registrado correctamente")
                     self.modal_close_job = self.after(650, self.close_registration_after_success)
             elif kind == "enroll_error":
                 if self.register_window is not None and self.register_window.winfo_exists():
-                    self.enrollment_hint.configure(text="No se completó el registro")
+                    self.enrollment_hint.configure(text=event[1], text_color=RED)
                     self.capture_button.configure(state="normal", text="Reintentar")
                     self.register_entry.configure(state="normal")
-                    messagebox.showerror("Registro", event[1], parent=self.register_window)
             elif kind == "storage_error":
                 self.detail_label.configure(text=f"No se guardó el intento: {event[1]}")
+                self.notify(f"No se guardó el intento: {event[1]}", error=True)
             elif kind == "engine_error":
                 self.backend_ready = False
                 self.detail_label.configure(text=f"Error del motor: {event[1]}")
+                self.settings_engine.configure(text="Error de motor", text_color=RED)
+                if self.mode == "hardware":
+                    self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
                 self.backend.stop()
-        if self.camera_connected:
+        if self.camera_connected and self.current_page in {"Inicio", "Escáner"}:
             latest = self.backend.latest_frame(self.last_frame_seq)
             if latest is not None:
                 self.last_frame_seq, frame = latest
@@ -624,7 +970,7 @@ class SafeApp(ctk.CTk):
             return
         self.running = False
         for job in (self.transition_job, self.backend_start_job, self.poll_job,
-                    self.clock_job, self.modal_close_job):
+                    self.clock_job, self.modal_close_job, self.search_job):
             if job is not None:
                 self.after_cancel(job)
         if self.register_window is not None and self.register_window.winfo_exists():

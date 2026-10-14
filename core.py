@@ -107,6 +107,22 @@ class FaceStore:
         name = self.users.get(str(label)) if distance <= MAX_DISTANCE else None
         return name, float(distance)
 
+    def list_people(self) -> list[tuple[str, str]]:
+        return sorted(self.users.items(), key=lambda item: item[1].casefold())
+
+    def delete_person(self, person_id: str) -> str:
+        if person_id not in self.users:
+            raise ValueError("El usuario ya no existe")
+        name = self.users[person_id]
+        updated = {key: value for key, value in self.users.items() if key != person_id}
+        temp = self.index_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(self.index_path)
+        self.users = updated
+        self.train()
+        shutil.rmtree(self.faces_dir / person_id)
+        return name
+
 
 class AccessHistory:
     def __init__(self, root: Path):
@@ -147,6 +163,16 @@ class AccessHistory:
         return self.db.execute(
             "SELECT fecha, usuario, resultado, distancia FROM accesos "
             "ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+    def search(self, user: str = "", result: str = "Todos", limit: int = 31,
+               offset: int = 0) -> list[tuple]:
+        pattern = "%" + user.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return self.db.execute(
+            "SELECT fecha, usuario, resultado, distancia, captura FROM accesos "
+            "WHERE usuario LIKE ? ESCAPE '\\' AND (? = 'Todos' OR resultado = ?) "
+            "ORDER BY id DESC LIMIT ? OFFSET ?",
+            (pattern, result, result, limit, offset),
         ).fetchall()
 
     def close(self) -> None:
@@ -316,7 +342,7 @@ class SafeBackend:
             history = AccessHistory(self.data_dir)
             face_detector = detector()
             bridge = CommandBridge(self.mode, self.port)
-            self.events.put(("ready", list(store.users.values()), history.recent()))
+            self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             while not self.stop_event.is_set():
                 while True:
                     try:
@@ -340,6 +366,23 @@ class SafeBackend:
                         samples = []
                         candidate_name, streak = None, 0
                         state("ESCANEANDO", "Esperando un rostro frente a la cámara")
+                    elif kind == "list_users":
+                        self.events.put(("users", store.list_people()))
+                    elif kind == "delete_user":
+                        try:
+                            deleted = store.delete_person(value or "")
+                            self.events.put(("user_deleted", deleted, store.list_people()))
+                            candidate_name, streak, logged_key = None, 0, None
+                            state("ESCANEANDO", "Modelo facial actualizado")
+                        except (OSError, ValueError) as exc:
+                            self.events.put(("user_error", str(exc)))
+                    elif kind == "search_history":
+                        try:
+                            user, result, offset = value
+                            self.events.put(("history_search", user, result, offset,
+                                             history.search(user, result, offset=offset)))
+                        except sqlite3.Error as exc:
+                            self.events.put(("storage_error", str(exc)))
                     elif kind == "stop":
                         break
                 if self.stop_event.is_set():

@@ -1,6 +1,6 @@
 # SAFEBOX AI
 
-Dashboard biométrico local para una demo universitaria. Usa la cámara del portátil para registrar y reconocer rostros autorizados. Muestra cinco estados: **escaneando**, **verificando**, **autorizado**, **denegado** y **cámara desconectada**. Incluye vista de cámara con marco biométrico animado, identidad, distancia LBPH real, cerradura y LED virtuales, historial y capturas de los intentos.
+Dashboard biométrico local para una demo universitaria. Usa la cámara del portátil para registrar y reconocer rostros autorizados. Muestra cinco estados: **escaneando**, **verificando**, **autorizado**, **denegado** y **cámara desconectada**. Incluye vista de cámara con marco biométrico animado, identidad, distancia LBPH real, cerradura y LED virtuales, historial y capturas de los intentos. La interfaz oscura se organiza en **Inicio**, **Escáner**, **Usuarios**, **Historial** y **Configuración**.
 
 ## Instalar y ejecutar
 
@@ -17,9 +17,10 @@ Si ya existe `.venv`, basta el último comando. Concede permiso de cámara a las
 
 ## Uso
 
-1. Pulsa **Registrar nuevo usuario**. En la ventana, escribe un nombre e inicia la captura. Mantén una sola cara frente a la cámara hasta completar las 20 muestras. Puedes cancelar el registro.
+1. En **Inicio** o **Usuarios**, pulsa **Registrar rostro**. En la ventana, escribe un nombre e inicia la captura. Mantén una sola cara frente a la cámara hasta completar las 20 muestras. Puedes cancelar el registro.
 2. Vuelve a aparecer frente a la cámara. Tras tres lecturas consistentes, el sistema muestra **AUTORIZADO**, la cerradura **DESBLOQUEADA** y el LED **AZUL**.
 3. Un rostro no registrado o varios rostros producen **DENEGADO**, cerradura **BLOQUEADA** y LED **ROJO**. Al no haber rostro, vuelve a **ESCANEANDO** con la cerradura bloqueada. Si la cámara falla, usa **Reintentar cámara**.
+4. En **Usuarios** puedes eliminar un registro tras confirmar la acción; el modelo LBPH se actualiza. En **Historial** puedes buscar por usuario, filtrar resultados, cambiar de página y abrir las capturas disponibles. Navegar no reinicia la cámara.
 
 Cada intento resuelto se registra una vez mientras el rostro permanece visible. La lista de la interfaz muestra los accesos recientes. El historial completo se guarda en `datos/historial.db`, las capturas en `datos/capturas/` y los rostros registrados en `datos/rostros/` con sus nombres en `datos/usuarios.json`. Estos archivos contienen datos biométricos: no los publiques en repositorios. Para reiniciar todos los registros, cierra la app y elimina `datos/`.
 
