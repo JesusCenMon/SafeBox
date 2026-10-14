@@ -5,10 +5,11 @@ from __future__ import annotations
 import argparse
 import queue
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from tkinter import Canvas
+from tkinter import Canvas, filedialog
 
 import cv2
 import customtkinter as ctk
@@ -17,6 +18,7 @@ from PIL import Image, ImageTk
 
 from core import (DEFAULT_SIMILARITY_THRESHOLD, ENROLL_SAMPLES, SafeBackend,
                   detect_faces, load_models)
+from control import AdminManager, SettingsStore
 
 
 BASE = Path(__file__).resolve().parent
@@ -54,14 +56,27 @@ def mix_color(start: str, end: str, amount: float) -> str:
 
 class SafeApp(ctk.CTk):
     def __init__(self, data_dir: Path, mode: str, port: str | None,
-                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
+                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+                 camera_index: int = 0, authorization_seconds: int = 8,
+                 settings: SettingsStore | None = None):
         super().__init__(fg_color=BG)
         self.title("SAFEBOX AI · Dashboard biométrico")
         self.geometry("1220x720+40+30")
         self.minsize(980, 650)
 
-        self.backend = SafeBackend(data_dir, mode, port, similarity_threshold)
+        self.settings = settings or SettingsStore(data_dir)
+        self.admin = AdminManager(data_dir)
+        self.admin_results: queue.Queue = queue.Queue()
+        self.admin_until = 0.0
+        self.admin_window = None
+        self.pending_settings = None
+        self.backend = SafeBackend(data_dir, mode, port, similarity_threshold,
+                                   camera_index, authorization_seconds)
+        self.backend.send("admin_ready", self.admin.configured)
         self.similarity_threshold = similarity_threshold
+        self.camera_index = camera_index
+        self.authorization_seconds = authorization_seconds
+        self.lock_state = "BLOQUEADA" if mode == "simulacion" else "ERROR"
         self.mode = mode
         self.running = True
         self.camera_connected = False
@@ -94,6 +109,8 @@ class SafeApp(ctk.CTk):
         self.backend_start_job = self.after(20, self.backend.start)
         self.poll_job = self.after(40, self.poll_backend)
         self.clock_job = self.after(1000, self.update_clock)
+        if not self.admin.configured:
+            self.after(100, self.prompt_create_pin)
 
     @staticmethod
     def card(parent, radius: int = 16) -> ctk.CTkFrame:
@@ -254,8 +271,9 @@ class SafeApp(ctk.CTk):
         self.distance_label = ctk.CTkLabel(metric, text="—", text_color=TEXT,
                                             font=ctk.CTkFont("Consolas", 21, "bold"))
         self.distance_label.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
-        ctk.CTkLabel(metric, text=f"UMBRAL  ≥ {self.similarity_threshold:.3f}   ·   MAYOR ES MEJOR",
-                     text_color=MUTED, font=ctk.CTkFont("Consolas", 9)).grid(
+        self.threshold_label = ctk.CTkLabel(metric, text=f"UMBRAL  ≥ {self.similarity_threshold:.3f}   ·   MAYOR ES MEJOR",
+                     text_color=MUTED, font=ctk.CTkFont("Consolas", 9))
+        self.threshold_label.grid(
             row=0, column=1, rowspan=2, sticky="e", padx=14
         )
 
@@ -266,8 +284,16 @@ class SafeApp(ctk.CTk):
         lock_card.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         led_card = self.card(hardware_row, 13)
         led_card.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL", "BLOQUEADA")
+        self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL",
+                                            "BLOQUEADA" if self.mode == "simulacion" else "SIN CONFIRMAR")
         self.led_value = self.device_label(led_card, "LED VIRTUAL", "APAGADO")
+        self.close_button = ctk.CTkButton(
+            lock_card, text="Confirmar cierre", height=29, corner_radius=16,
+            fg_color=SURFACE_2, hover_color=BORDER, text_color=TEXT,
+            font=ctk.CTkFont("Segoe UI", 10, "bold"),
+            command=self.confirm_door_closed)
+        self.close_button.pack(fill="x", padx=10, pady=(0, 10))
+        self.close_button.pack_forget()
 
         activity = self.card(side)
         activity.grid(row=2, column=0, sticky="nsew")
@@ -352,9 +378,13 @@ class SafeApp(ctk.CTk):
         filters = self.card(history)
         filters.grid(row=2, column=0, sticky="nsew")
         filters.grid_columnconfigure(0, weight=1)
-        filters.grid_rowconfigure(2, weight=1)
+        filters.grid_rowconfigure(3, weight=1)
+        self.stats_label = ctk.CTkLabel(
+            filters, text="Cargando estadísticas…", text_color=TEXT,
+            font=ctk.CTkFont("Segoe UI", 12, "bold"))
+        self.stats_label.grid(row=0, column=0, sticky="w", padx=24, pady=(15, 0))
         search_row = ctk.CTkFrame(filters, fg_color="transparent")
-        search_row.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 12))
+        search_row.grid(row=1, column=0, sticky="ew", padx=20, pady=(10, 12))
         search_row.grid_columnconfigure(0, weight=1)
         self.history_search = ctk.CTkEntry(
             search_row, placeholder_text="Buscar usuario…", height=40,
@@ -367,14 +397,17 @@ class SafeApp(ctk.CTk):
             button_color=BORDER, button_hover_color="#505050",
             text_color=TEXT, command=lambda _: self.reset_history_search())
         self.history_filter.grid(row=0, column=1)
+        ctk.CTkButton(search_row, text="Exportar CSV", width=115, height=40,
+                      corner_radius=20, fg_color=BORDER, hover_color="#505050",
+                      text_color=TEXT, command=self.export_history).grid(row=0, column=2, padx=(10, 0))
         self.history_note = ctk.CTkLabel(
             filters, text="Cargando historial…", text_color=MUTED,
             font=ctk.CTkFont("Segoe UI", 11))
-        self.history_note.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 8))
+        self.history_note.grid(row=2, column=0, sticky="w", padx=24, pady=(0, 8))
         self.history_full_list = ctk.CTkScrollableFrame(filters, fg_color="transparent")
-        self.history_full_list.grid(row=2, column=0, sticky="nsew", padx=17, pady=(0, 16))
+        self.history_full_list.grid(row=3, column=0, sticky="nsew", padx=17, pady=(0, 16))
         pager = ctk.CTkFrame(filters, fg_color="transparent")
-        pager.grid(row=3, column=0, sticky="e", padx=20, pady=(0, 16))
+        pager.grid(row=4, column=0, sticky="e", padx=20, pady=(0, 16))
         self.history_prev = ctk.CTkButton(pager, text="Anterior", width=95, height=30,
                                            corner_radius=16, fg_color=SURFACE_2,
                                            hover_color=BORDER, command=lambda: self.change_history_page(-1))
@@ -385,7 +418,7 @@ class SafeApp(ctk.CTk):
         self.history_next.pack(side="left")
 
         settings = self.pages["Configuración"]
-        settings_card = self.card(settings)
+        settings_card = ctk.CTkScrollableFrame(settings, fg_color=SURFACE, corner_radius=16)
         settings_card.grid(row=2, column=0, sticky="nsew")
         settings_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(settings_card, text="Conexiones y datos", text_color=TEXT,
@@ -393,21 +426,51 @@ class SafeApp(ctk.CTk):
             row=0, column=0, sticky="w", padx=24, pady=(16, 8))
         self.settings_camera = self.setting_line(settings_card, 1, "Cámara", "Iniciando…")
         self.settings_engine = self.setting_line(settings_card, 2, "Reconocimiento", "Iniciando…")
-        self.setting_line(settings_card, 3, "Modelo facial",
-                          f"YuNet + SFace · CPU · umbral ≥ {self.similarity_threshold:.3f}")
-        mode_text = "Simulación · sin hardware conectado" if self.mode == "simulacion" else f"Hardware · {self.backend.port}"
-        self.setting_line(settings_card, 4, "Modo", mode_text)
+        self.setting_line(settings_card, 3, "Modelo facial", "YuNet + SFace · CPU")
+        mode_text = "Simulación · sin hardware conectado" if self.mode == "simulacion" else f"Hardware · esperando conexión ({self.backend.port})"
+        self.settings_device = self.setting_line(settings_card, 4, "Modo", mode_text)
         self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
+        self.threshold_entry = self.setting_input(settings_card, 6, "Umbral SFace", f"{self.similarity_threshold:.3f}")
+        self.duration_entry = self.setting_input(settings_card, 7, "Autorización (segundos)", str(self.authorization_seconds))
+        self.camera_choice = ctk.CTkOptionMenu(settings_card, values=[f"Cámara {i}" for i in range(10)],
+                                               fg_color=SURFACE_2, button_color=BORDER)
+        self.camera_choice.set(f"Cámara {self.camera_index}")
+        self.camera_choice.grid(row=8, column=0, sticky="ew", padx=24, pady=4)
+        self.mode_choice = ctk.CTkOptionMenu(settings_card, values=["Simulación", "Hardware"],
+                                             fg_color=SURFACE_2, button_color=BORDER)
+        self.mode_choice.set("Simulación" if self.mode == "simulacion" else "Hardware")
+        self.mode_choice.grid(row=9, column=0, sticky="ew", padx=24, pady=4)
+        self.port_entry = self.setting_input(settings_card, 10, "Puerto serial (COMx)", self.backend.port or "")
+        actions = ctk.CTkFrame(settings_card, fg_color="transparent")
+        actions.grid(row=11, column=0, sticky="w", padx=24, pady=12)
+        ctk.CTkButton(actions, text="Guardar ajustes y comprobar conexión", width=265,
+                      height=38, corner_radius=20, fg_color=CYAN, hover_color="#1DB954",
+                      text_color=BG, command=self.save_settings).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Cambiar PIN", width=105, height=38, corner_radius=20,
+                      fg_color=SURFACE_2, hover_color=BORDER, command=self.change_pin).pack(side="left", padx=4)
+        ctk.CTkButton(actions, text="Cerrar sesión", width=120, height=38, corner_radius=20,
+                      fg_color=SURFACE_2, hover_color=BORDER, command=self.lock_admin_session).pack(side="left", padx=4)
         self.settings_retry = ctk.CTkButton(
             settings_card, text="Reintentar cámara", width=170,
             height=38, corner_radius=20, fg_color=SURFACE_2,
             hover_color=BORDER, text_color=TEXT, command=self.open_camera)
-        self.settings_retry.grid(row=6, column=0, sticky="w", padx=24, pady=(12, 8))
+        self.settings_retry.grid(row=12, column=0, sticky="w", padx=24, pady=(4, 8))
         ctk.CTkLabel(settings_card,
-                     text="Los comandos WeMos solo se envían al iniciar con --mode hardware --port COMx.",
+                     text="El modo hardware requiere ESP32 y ACK serial. Confirma el cierre antes de volver a bloquear.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=650, justify="left").grid(
-            row=7, column=0, sticky="w", padx=24, pady=(0, 14))
+            row=13, column=0, sticky="w", padx=24, pady=(0, 14))
+
+    @staticmethod
+    def setting_input(parent, row: int, title: str, value: str) -> ctk.CTkEntry:
+        line = ctk.CTkFrame(parent, fg_color=SURFACE_2, corner_radius=10)
+        line.grid(row=row, column=0, sticky="ew", padx=24, pady=4)
+        line.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(line, text=title, text_color=MUTED).grid(row=0, column=0, padx=16, pady=8)
+        entry = ctk.CTkEntry(line, width=190)
+        entry.insert(0, value)
+        entry.grid(row=0, column=1, sticky="e", padx=16, pady=8)
+        return entry
 
     @staticmethod
     def setting_line(parent, row: int, title: str, value: str) -> ctk.CTkLabel:
@@ -481,7 +544,11 @@ class SafeApp(ctk.CTk):
                           text_color=RED, command=lambda uid=person_id, label=name:
                           self.confirm_delete(uid, label)).grid(row=0, column=2, rowspan=2, padx=14)
 
-    def confirm_delete(self, person_id: str, name: str) -> None:
+    def confirm_delete(self, person_id: str, name: str, authorized: bool = False) -> None:
+        if not authorized:
+            self.require_admin("Eliminar usuario",
+                               lambda: self.confirm_delete(person_id, name, True))
+            return
         window = ctk.CTkToplevel(self, fg_color=BG)
         window.title("SAFEBOX AI · Confirmar eliminación")
         window.geometry("420x210")
@@ -501,8 +568,8 @@ class SafeApp(ctk.CTk):
                       corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
                       command=window.destroy).pack(side="left")
         def remove() -> None:
-            self.backend.send("delete_user", person_id)
             window.destroy()
+            self.require_admin("Eliminar usuario", lambda: self.backend.send("delete_user", person_id))
         ctk.CTkButton(actions, text="Eliminar", width=125, height=38,
                       corner_radius=20, fg_color="#883F4D", hover_color="#A54A5B",
                       command=remove).pack(side="right")
@@ -510,6 +577,185 @@ class SafeApp(ctk.CTk):
     def notify(self, message: str, error: bool = False) -> None:
         self.notice_label.configure(text=message, text_color=RED if error else CYAN)
         self.after(5000, lambda: self.notice_label.configure(text="") if self.running else None)
+
+    def submit_admin(self, operation, success, error_label, button) -> None:
+        def worker() -> None:
+            try:
+                operation()
+                self.admin_results.put((success, error_label, button, None))
+            except (ValueError, PermissionError, OSError) as exc:
+                self.admin_results.put((success, error_label, button, str(exc)))
+        threading.Thread(target=worker, daemon=True, name="safebox-admin").start()
+
+    def pin_window(self, title: str, height: int = 235):
+        if self.admin_window is not None and self.admin_window.winfo_exists():
+            self.admin_window.focus()
+            return None
+        window = ctk.CTkToplevel(self, fg_color=BG)
+        self.admin_window = window
+        window.title(f"SAFEBOX AI · {title}")
+        window.geometry(f"410x{height}")
+        window.resizable(False, False)
+        window.transient(self)
+        window.grab_set()
+        window.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(window, text=title, text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 21, "bold")).grid(
+            row=0, column=0, sticky="w", padx=26, pady=(22, 8))
+        return window
+
+    def close_pin_window(self) -> None:
+        if self.admin_window is not None and self.admin_window.winfo_exists():
+            self.admin_window.grab_release()
+            self.admin_window.destroy()
+        self.admin_window = None
+
+    def prompt_create_pin(self) -> None:
+        if self.admin.configured or not self.running:
+            return
+        window = self.pin_window("Crear PIN de administrador", 280)
+        if window is None:
+            return
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        first = ctk.CTkEntry(window, placeholder_text="PIN de 6 a 12 dígitos", show="•",
+                             height=40, corner_radius=20)
+        first.grid(row=1, column=0, sticky="ew", padx=26, pady=6)
+        second = ctk.CTkEntry(window, placeholder_text="Repetir PIN", show="•",
+                              height=40, corner_radius=20)
+        second.grid(row=2, column=0, sticky="ew", padx=26, pady=6)
+        error = ctk.CTkLabel(window, text="El PIN protege altas, bajas y ajustes.", text_color=MUTED)
+        error.grid(row=3, column=0, sticky="w", padx=26, pady=5)
+        button = ctk.CTkButton(window, text="Crear PIN", height=40, corner_radius=20,
+                               fg_color=CYAN, hover_color="#1DB954", text_color=BG)
+        button.grid(row=4, column=0, sticky="ew", padx=26, pady=8)
+        def submit() -> None:
+            pin = first.get()
+            if pin != second.get():
+                error.configure(text="Los PIN no coinciden", text_color=RED)
+                return
+            button.configure(state="disabled")
+            def done() -> None:
+                self.admin_until = time.monotonic() + 120
+                self.backend.send("admin_ready", True)
+                self.close_pin_window()
+                self.notify("PIN de administrador creado")
+            self.submit_admin(lambda: self.admin.create(pin), done, error, button)
+        button.configure(command=submit)
+        first.focus_set()
+
+    def require_admin(self, title: str, action) -> None:
+        if not self.admin.configured:
+            self.prompt_create_pin()
+            return
+        if time.monotonic() < self.admin_until:
+            self.admin_until = time.monotonic() + 120
+            action()
+            return
+        window = self.pin_window(title)
+        if window is None:
+            return
+        window.protocol("WM_DELETE_WINDOW", self.close_pin_window)
+        entry = ctk.CTkEntry(window, placeholder_text="PIN de administrador", show="•",
+                             height=42, corner_radius=21)
+        entry.grid(row=1, column=0, sticky="ew", padx=26, pady=10)
+        error = ctk.CTkLabel(window, text="Sesión de 2 minutos tras verificar.", text_color=MUTED)
+        error.grid(row=2, column=0, sticky="w", padx=26)
+        button = ctk.CTkButton(window, text="Verificar PIN", height=40, corner_radius=20,
+                               fg_color=CYAN, hover_color="#1DB954", text_color=BG)
+        button.grid(row=3, column=0, sticky="ew", padx=26, pady=14)
+        def submit() -> None:
+            pin = entry.get()
+            button.configure(state="disabled")
+            def done() -> None:
+                self.admin_until = time.monotonic() + 120
+                self.close_pin_window()
+                action()
+            self.submit_admin(lambda: self.admin.verify(pin), done, error, button)
+        button.configure(command=submit)
+        entry.focus_set()
+
+    def change_pin(self) -> None:
+        window = self.pin_window("Cambiar PIN", 330)
+        if window is None:
+            return
+        window.protocol("WM_DELETE_WINDOW", self.close_pin_window)
+        entries = []
+        for row, placeholder in enumerate(("PIN actual", "PIN nuevo", "Repetir PIN nuevo"), 1):
+            entry = ctk.CTkEntry(window, placeholder_text=placeholder, show="•",
+                                 height=40, corner_radius=20)
+            entry.grid(row=row, column=0, sticky="ew", padx=26, pady=6)
+            entries.append(entry)
+        error = ctk.CTkLabel(window, text="", text_color=RED)
+        error.grid(row=4, column=0, sticky="w", padx=26)
+        button = ctk.CTkButton(window, text="Guardar PIN", height=40, corner_radius=20,
+                               fg_color=CYAN, hover_color="#1DB954", text_color=BG)
+        button.grid(row=5, column=0, sticky="ew", padx=26, pady=12)
+        def submit() -> None:
+            old_pin, new_pin, repeated = (entry.get() for entry in entries)
+            if new_pin != repeated:
+                error.configure(text="Los PIN nuevos no coinciden")
+                return
+            button.configure(state="disabled")
+            def done() -> None:
+                self.admin_until = 0.0
+                self.close_pin_window()
+                self.notify("PIN actualizado; sesión bloqueada")
+            self.submit_admin(lambda: self.admin.change(old_pin, new_pin), done, error, button)
+        button.configure(command=submit)
+
+    def lock_admin_session(self) -> None:
+        self.admin_until = 0.0
+        self.notify("Sesión administrativa cerrada")
+
+    def save_settings(self) -> None:
+        try:
+            values = {
+                "similarity_threshold": float(self.threshold_entry.get().replace(",", ".")),
+                "authorization_seconds": int(self.duration_entry.get()),
+                "camera_index": int(self.camera_choice.get().split()[-1]),
+                "mode": "hardware" if self.mode_choice.get() == "Hardware" else "simulacion",
+                "port": self.port_entry.get().strip().upper(),
+            }
+            self.settings.validate(values)
+        except (ValueError, TypeError) as exc:
+            self.notify(f"Ajustes inválidos: {exc}", error=True)
+            return
+        self.require_admin("Guardar configuración", lambda: self.apply_settings(values))
+
+    def apply_settings(self, values: dict) -> None:
+        if values["mode"] != self.mode or values["port"] != (self.backend.port or ""):
+            self.pending_settings = values
+            self.notify("Comprobando conexión serial…")
+            self.backend.send("connect_device", (values["mode"], values["port"]))
+        else:
+            self.commit_settings(values)
+
+    def commit_settings(self, values: dict) -> None:
+        try:
+            self.settings.save(values)
+        except (ValueError, OSError) as exc:
+            self.notify(f"No se guardaron los ajustes: {exc}", error=True)
+            return
+        self.backend.send("update_settings", (values["similarity_threshold"],
+                                               values["authorization_seconds"]))
+        if values["camera_index"] != self.camera_index:
+            self.backend.select_camera(values["camera_index"])
+        self.camera_index = values["camera_index"]
+        self.authorization_seconds = values["authorization_seconds"]
+        self.similarity_threshold = values["similarity_threshold"]
+        self.threshold_label.configure(text=f"UMBRAL  ≥ {self.similarity_threshold:.3f}   ·   MAYOR ES MEJOR")
+        self.mode = values["mode"]
+        self.backend.port = values["port"]
+        self.notify("Ajustes guardados")
+
+    def export_history(self) -> None:
+        self.require_admin("Exportar historial", self.choose_history_export)
+
+    def choose_history_export(self) -> None:
+        path = filedialog.asksaveasfilename(parent=self, title="Exportar historial",
+                                            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if path:
+            self.backend.send("export_history", Path(path))
 
     def schedule_history_search(self, _event=None) -> None:
         if self.search_job is not None:
@@ -689,13 +935,29 @@ class SafeApp(ctk.CTk):
         if similarity is not None:
             scan_text += f" · coseno {similarity:.3f}"
         self.scan_result.configure(text=scan_text, text_color=color)
-        unlocked = state == "AUTORIZADO"
-        self.lock_value.configure(text="DESBLOQUEADA" if unlocked else "BLOQUEADA",
-                                  text_color=CYAN if unlocked else TEXT)
-        led = "AZUL" if unlocked else "ROJO" if state == "DENEGADO" else "APAGADO"
+        led = "AZUL" if self.lock_state in {"DESBLOQUEADA", "ESPERANDO CIERRE"} else "ROJO" if state == "DENEGADO" else "APAGADO"
         self.led_value.configure(text=led, text_color=BLUE if led == "AZUL" else RED if led == "ROJO" else MUTED)
 
-    def open_registration(self, name: str = "") -> None:
+    def update_lock(self, state: str, reason: str) -> None:
+        self.lock_state = state
+        label = "BLOQUEO ORDENADO" if state == "BLOQUEADA" and self.mode == "hardware" else state
+        self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
+                                  CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
+        if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
+            self.close_button.pack(fill="x", padx=10, pady=(0, 10))
+        else:
+            self.close_button.pack_forget()
+        if reason and state in {"ESPERANDO CIERRE", "ERROR"}:
+            self.notify(reason, error=state == "ERROR")
+
+    def confirm_door_closed(self) -> None:
+        self.require_admin("Confirmar cierre", lambda: self.backend.send("confirm_closed"))
+
+    def open_registration(self, name: str = "", authorized: bool = False) -> None:
+        if not authorized:
+            self.require_admin("Registrar rostro",
+                               lambda: self.open_registration(name, True))
+            return
         if self.register_window is not None and self.register_window.winfo_exists():
             self.register_window.focus()
             return
@@ -752,7 +1014,10 @@ class SafeApp(ctk.CTk):
         self.capture_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self.register_entry.focus_set()
 
-    def start_enrollment(self) -> None:
+    def start_enrollment(self, authorized: bool = False) -> None:
+        if not authorized:
+            self.require_admin("Registrar rostro", lambda: self.start_enrollment(True))
+            return
         name = self.register_entry.get().strip()
         if not re.fullmatch(r"[\w .-]{2,40}", name, flags=re.UNICODE):
             self.enrollment_hint.configure(text="Usa 2 a 40 letras, números, espacios, puntos o guiones.", text_color=RED)
@@ -819,6 +1084,18 @@ class SafeApp(ctk.CTk):
     def poll_backend(self) -> None:
         if not self.running:
             return
+        for _ in range(5):
+            try:
+                success, label, button, error = self.admin_results.get_nowait()
+            except queue.Empty:
+                break
+            if error:
+                if label.winfo_exists():
+                    label.configure(text=error, text_color=RED)
+                if button.winfo_exists():
+                    button.configure(state="normal")
+            else:
+                success()
         for _ in range(60):
             try:
                 event = self.backend.events.get_nowait()
@@ -834,8 +1111,6 @@ class SafeApp(ctk.CTk):
                 self.refresh_history()
                 self.refresh_users()
                 self.settings_engine.configure(text="Listo · YuNet + SFace", text_color=CYAN)
-                if self.mode == "hardware":
-                    self.mode_badge.configure(text="●  HARDWARE CONECTADO", text_color=CYAN)
                 if self.current_page == "Historial":
                     self.request_history()
                 if self.camera_connected:
@@ -874,6 +1149,27 @@ class SafeApp(ctk.CTk):
                 self.refresh_history()
                 if self.current_page == "Historial":
                     self.request_history()
+            elif kind == "stats":
+                total, allowed, denied, latest = event[1]
+                last = latest[:19].replace("T", " ") if latest else "—"
+                self.stats_label.configure(text=f"Intentos {total}   ·   Autorizados {allowed}   ·   Denegados {denied}   ·   Último {last}")
+            elif kind == "lock":
+                self.update_lock(event[1], event[2])
+            elif kind == "device":
+                mode, port = event[1], event[2]
+                self.mode_badge.configure(text="●  HARDWARE CONECTADO" if mode == "hardware" else "●  SIMULACIÓN",
+                                          text_color=CYAN)
+                self.settings_device.configure(text=f"Hardware · {port}" if mode == "hardware" else "Simulación · sin hardware conectado")
+                if self.pending_settings is not None:
+                    values, self.pending_settings = self.pending_settings, None
+                    self.commit_settings(values)
+            elif kind == "device_error":
+                self.pending_settings = None
+                self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
+                self.settings_device.configure(text=event[1], text_color=RED)
+                self.notify(event[1], error=True)
+            elif kind == "export_done":
+                self.notify(f"{event[1]} intentos exportados a CSV")
             elif kind == "history_search":
                 if (event[1], event[2], event[3]) == (self.history_search.get().strip(),
                                                      self.history_filter.get(), self.history_offset):
@@ -1006,6 +1302,7 @@ class SafeApp(ctk.CTk):
         if not self.running:
             return
         self.running = False
+        self.admin_until = 0.0
         for job in (self.transition_job, self.backend_start_job, self.poll_job,
                     self.clock_job, self.modal_close_job, self.search_job):
             if job is not None:
@@ -1014,6 +1311,7 @@ class SafeApp(ctk.CTk):
             self.register_window.grab_release()
             self.register_window.destroy()
             self.register_window = None
+        self.close_pin_window()
         self.withdraw()
         self.backend.stop()
         self.close_deadline = time.monotonic() + 10.0
@@ -1041,11 +1339,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SAFEBOX AI · dashboard biométrico local")
     parser.add_argument("--self-test", action="store_true", help="verifica software sin cámara")
     parser.add_argument("--data-dir", type=Path, default=BASE / "datos")
-    parser.add_argument("--mode", choices=("simulacion", "hardware"), default="simulacion")
+    parser.add_argument("--mode", choices=("simulacion", "hardware"))
     parser.add_argument("--port", help="puerto de la WeMos, por ejemplo COM3")
     parser.add_argument("--similarity-threshold", type=float,
-                        default=DEFAULT_SIMILARITY_THRESHOLD,
                         help="umbral coseno SFace entre 0 y 1 (predeterminado: 0.363)")
+    parser.add_argument("--camera-index", type=int, help="índice de cámara")
+    parser.add_argument("--authorization-seconds", type=int, help="tiempo para confirmar cierre")
     args = parser.parse_args()
     if args.self_test:
         try:
@@ -1055,7 +1354,18 @@ def main() -> None:
         return
     ctk.set_appearance_mode("dark")
     try:
-        app = SafeApp(args.data_dir, args.mode, args.port, args.similarity_threshold)
+        settings = SettingsStore(args.data_dir)
+        values = dict(settings.values)
+        for key, supplied in (("mode", args.mode), ("port", args.port),
+                              ("similarity_threshold", args.similarity_threshold),
+                              ("camera_index", args.camera_index),
+                              ("authorization_seconds", args.authorization_seconds)):
+            if supplied is not None:
+                values[key] = supplied
+        settings.validate(values)
+        app = SafeApp(args.data_dir, values["mode"], values["port"],
+                      values["similarity_threshold"], values["camera_index"],
+                      values["authorization_seconds"], settings)
     except Exception as exc:
         raise SystemExit(f"No se pudo iniciar SAFEBOX AI: {exc}") from exc
     app.mainloop()

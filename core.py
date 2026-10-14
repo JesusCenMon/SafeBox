@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import csv
 import queue
 import shutil
 import sqlite3
@@ -15,6 +16,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+from control import LockController
 
 
 MODEL_DIR = Path(__file__).resolve().parent / "models"
@@ -231,17 +234,38 @@ class AccessHistory:
             (pattern, result, result, limit, offset),
         ).fetchall()
 
+    def stats(self) -> tuple[int, int, int, str | None]:
+        total, allowed, denied, latest = self.db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(resultado='AUTORIZADO'),0), "
+            "COALESCE(SUM(resultado='DENEGADO'),0), MAX(fecha) FROM accesos"
+        ).fetchone()
+        return int(total), int(allowed), int(denied), latest
+
+    def export_csv(self, path: Path) -> int:
+        rows = self.db.execute(
+            "SELECT fecha, usuario, resultado, distancia, similitud FROM accesos ORDER BY id DESC"
+        )
+        count = 0
+        with path.open("w", encoding="utf-8-sig", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(("fecha", "usuario", "resultado", "distancia_lbph", "similitud_sface"))
+            for row in rows:
+                writer.writerow(row)
+                count += 1
+        return count
+
     def close(self) -> None:
         self.db.close()
 
 
 class CommandBridge:
-    """Simulación por defecto; serial opcional para la WeMos."""
+    """Comandos con ACK; ninguna acción de servo implícita al conectar o cerrar."""
 
     def __init__(self, mode: str, port: str | None = None, baudrate: int = 115200):
         self.mode = mode
         self.serial = None
         self.last_command = None
+        self.sequence = 0
         if mode == "hardware":
             if not port:
                 raise ValueError("El modo hardware requiere --port COMx")
@@ -251,40 +275,63 @@ class CommandBridge:
                 raise RuntimeError(
                     "Instala pyserial para usar hardware: python -m pip install pyserial"
                 ) from exc
-            self.serial = serial.Serial(port=port, baudrate=baudrate, timeout=1)
-        self.send("LOCK")
+            self.serial = serial.Serial(port=port, baudrate=baudrate,
+                                        timeout=0.1, write_timeout=0.5)
+            try:
+                self.send("PING", timeout=4.0)
+            except Exception:
+                self.serial.close()
+                raise
 
-    def send(self, command: str) -> None:
-        if command not in {"OPEN", "LOCK", "DENIED"}:
+    def send(self, command: str, timeout: float = 1.5) -> None:
+        if command not in {"OPEN", "LOCK", "DENIED", "IDLE", "PING"}:
             raise ValueError("Comando no permitido")
-        if command == self.last_command:
-            return
+        if self.mode == "hardware" and self.serial is None:
+            raise ConnectionError("ESP32 sin conexión")
         if self.serial is not None:
-            self.serial.write((command + "\n").encode("ascii"))
-        self.last_command = command
+            self.sequence += 1
+            sequence = self.sequence
+            try:
+                self.serial.write(f"{command} {sequence}\n".encode("ascii"))
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    line = self.serial.readline().decode("ascii", errors="replace").strip()
+                    if line == f"ACK {sequence} {command}":
+                        break
+                    if line == f"ERR {sequence} {command}":
+                        raise ConnectionError(f"ESP32 rechazó {command}")
+                else:
+                    raise TimeoutError(f"Sin ACK para {command}")
+            except (OSError, TimeoutError, ConnectionError):
+                self.close()
+                raise
+        if command != "PING":
+            self.last_command = command
 
     def close(self) -> None:
-        try:
-            self.send("LOCK")
-        finally:
-            if self.serial is not None:
-                self.serial.close()
+        if self.serial is not None:
+            self.serial.close()
+            self.serial = None
 
 
 class SafeBackend:
     """La cámara y el motor son dueños de sus recursos; Tk nunca sale del hilo principal."""
 
     def __init__(self, data_dir: Path, mode: str, port: str | None,
-                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
+                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
+                 camera_index: int = 0, authorization_seconds: int = 8):
         if not 0.0 < similarity_threshold < 1.0:
             raise ValueError("El umbral de similitud debe estar entre 0 y 1")
         self.data_dir = data_dir
         self.mode = mode
         self.port = port
         self.similarity_threshold = similarity_threshold
+        self.camera_index = camera_index
+        self.authorization_seconds = authorization_seconds
+        self.admin_ready = False
         self.events: queue.Queue[tuple] = queue.Queue()
         self.commands: queue.Queue[tuple] = queue.Queue()
-        self.camera_commands: queue.Queue[str] = queue.Queue()
+        self.camera_commands: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.frame_lock = threading.Lock()
         self.frame: np.ndarray | None = None
@@ -309,6 +356,9 @@ class SafeBackend:
     def retry_camera(self) -> None:
         self.camera_commands.put("retry")
 
+    def select_camera(self, index: int) -> None:
+        self.camera_commands.put(("switch", index))
+
     def stop(self) -> None:
         self.stop_event.set()
         self.commands.put(("stop", None))
@@ -325,18 +375,20 @@ class SafeBackend:
                 if capture is None:
                     if not open_requested:
                         try:
-                            self.camera_commands.get(timeout=0.2)
+                            camera_command = self.camera_commands.get(timeout=0.2)
+                            if isinstance(camera_command, tuple) and camera_command[0] == "switch":
+                                self.camera_index = camera_command[1]
                         except queue.Empty:
                             continue
                     open_requested = False
                     if self.stop_event.is_set():
                         break
                     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-                    candidate = cv2.VideoCapture(0, backend)
+                    candidate = cv2.VideoCapture(self.camera_index, backend)
                     if not candidate.isOpened():
                         candidate.release()
                         self.camera_connected = False
-                        self.events.put(("camera", False, "Cámara no disponible"))
+                        self.events.put(("camera", False, f"Cámara {self.camera_index} no disponible"))
                         continue
                     capture = candidate
                     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -344,6 +396,18 @@ class SafeBackend:
                     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     self.camera_connected = True
                     self.events.put(("camera", True, ""))
+                try:
+                    camera_command = self.camera_commands.get_nowait()
+                except queue.Empty:
+                    camera_command = None
+                if isinstance(camera_command, tuple) and camera_command[0] == "switch":
+                    self.camera_index = camera_command[1]
+                    capture.release()
+                    capture = None
+                    self.camera_connected = False
+                    self.events.put(("camera", False, "Cambiando cámara…"))
+                    open_requested = True
+                    continue
                 read_started = time.monotonic()
                 ok, frame = capture.read()
                 if not ok:
@@ -368,6 +432,7 @@ class SafeBackend:
     def _engine_loop(self) -> None:
         history = None
         bridge = None
+        controller = LockController(self.authorization_seconds, ready=self.mode == "simulacion")
         last_state: tuple | None = None
         last_seq = 0
         last_analyze = 0.0
@@ -386,14 +451,16 @@ class SafeBackend:
             if payload != last_state:
                 self.events.put(("state", name, detail, user, similarity, list(boxes or ())))
                 last_state = payload
-            command = "OPEN" if name == "AUTORIZADO" else "DENIED" if name == "DENEGADO" else "LOCK"
-            bridge.send(command)
+
+        def publish_lock() -> None:
+            self.events.put(("lock", controller.state, controller.reason))
 
         def record_attempt(user: str, result: str, similarity: float | None,
                            frame: np.ndarray) -> None:
             try:
                 history.record(user, result, similarity, frame)
                 self.events.put(("history", history.recent()))
+                self.events.put(("stats", history.stats()))
             except (OSError, sqlite3.Error) as exc:
                 self.events.put(("storage_error", str(exc)))
 
@@ -401,9 +468,22 @@ class SafeBackend:
             store = FaceStore(self.data_dir)
             history = AccessHistory(self.data_dir)
             face_detector, face_recognizer = load_models()
-            bridge = CommandBridge(self.mode, self.port)
+            try:
+                bridge = CommandBridge(self.mode, self.port)
+                if self.mode == "hardware":
+                    controller.state = LockController.WAITING_CLOSE
+                    controller.reason = "Conexión verificada; confirma el cierre antes de bloquear"
+                self.events.put(("device", self.mode, self.port))
+            except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
+                controller.fail(f"ESP32 sin conexión: {exc}")
+                self.events.put(("device_error", controller.reason))
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
+            self.events.put(("stats", history.stats()))
+            publish_lock()
             while not self.stop_event.is_set():
+                if controller.tick():
+                    controller.reason = "Tiempo cumplido; confirma el cierre antes de bloquear"
+                    publish_lock()
                 while True:
                     try:
                         kind, value = self.commands.get_nowait()
@@ -444,6 +524,43 @@ class SafeBackend:
                                              history.search(user, result, offset=offset)))
                         except sqlite3.Error as exc:
                             self.events.put(("storage_error", str(exc)))
+                    elif kind == "admin_ready":
+                        self.admin_ready = bool(value)
+                    elif kind == "update_settings":
+                        self.similarity_threshold, controller.authorization_seconds = value
+                    elif kind == "confirm_closed":
+                        if bridge is None:
+                            controller.fail("Sin comunicación con la ESP32")
+                        else:
+                            controller.confirm_closed(bridge)
+                        publish_lock()
+                    elif kind == "connect_device":
+                        new_mode, new_port = value
+                        if controller.state in {LockController.UNLOCKED, LockController.PENDING}:
+                            self.events.put(("device_error", "Confirma el cierre antes de cambiar de modo"))
+                        else:
+                            try:
+                                candidate = CommandBridge(new_mode, new_port)
+                                if bridge is not None:
+                                    bridge.close()
+                                bridge = candidate
+                                self.mode, self.port = new_mode, new_port
+                                controller.state = (LockController.LOCKED if new_mode == "simulacion"
+                                                    else LockController.WAITING_CLOSE)
+                                controller.reason = ("Simulación activa" if new_mode == "simulacion" else
+                                                     "ESP32 conectada; confirma el cierre")
+                                self.events.put(("device", new_mode, new_port))
+                                publish_lock()
+                            except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
+                                self.events.put(("device_error", str(exc)))
+                    elif kind == "stats":
+                        self.events.put(("stats", history.stats()))
+                    elif kind == "export_history":
+                        try:
+                            count = history.export_csv(Path(value))
+                            self.events.put(("export_done", count, value))
+                        except (OSError, sqlite3.Error) as exc:
+                            self.events.put(("storage_error", str(exc)))
                     elif kind == "stop":
                         break
                 if self.stop_event.is_set():
@@ -469,6 +586,12 @@ class SafeBackend:
                 if count == 0:
                     candidate_name, streak = None, 0
                     if now - last_face_seen > 1.0:
+                        if logged_key is not None and controller.state == LockController.LOCKED and bridge is not None:
+                            try:
+                                bridge.send("IDLE")
+                            except (OSError, TimeoutError, ConnectionError) as exc:
+                                controller.fail(f"ESP32 sin respuesta: {exc}")
+                                publish_lock()
                         logged_key = None
                     if enrolling_name:
                         state("REGISTRANDO", "Muestra un rostro para continuar", enrolling_name)
@@ -484,6 +607,12 @@ class SafeBackend:
                         state("DENEGADO", "Hay varios rostros en cámara", "Varios rostros", boxes=boxes)
                         if logged_key != "multiple":
                             record_attempt("Varios rostros", "DENEGADO", None, frame)
+                            if controller.state == LockController.LOCKED and bridge is not None:
+                                try:
+                                    bridge.send("DENIED")
+                                except (OSError, TimeoutError, ConnectionError) as exc:
+                                    controller.fail(f"ESP32 sin respuesta: {exc}")
+                                    publish_lock()
                             logged_key = "multiple"
                     continue
                 try:
@@ -518,8 +647,13 @@ class SafeBackend:
                 if streak < 3:
                     state("VERIFICANDO", f"Lectura {streak}/3", similarity=similarity, boxes=boxes)
                 elif name is not None:
-                    state("AUTORIZADO", "Coincidencia confirmada", name, similarity, boxes)
                     key = f"allow:{name}"
+                    detail = "Coincidencia confirmada" if self.admin_ready else "Configura el PIN para habilitar aperturas"
+                    state("AUTORIZADO", detail, name, similarity, boxes)
+                    if (logged_key != key and self.admin_ready and
+                            controller.state == LockController.LOCKED and bridge is not None):
+                        controller.authorize(bridge, publish_lock)
+                        publish_lock()
                     if logged_key != key:
                         record_attempt(name, "AUTORIZADO", similarity, frame)
                         logged_key = key
@@ -528,6 +662,12 @@ class SafeBackend:
                     state("DENEGADO", detail, "Desconocido", similarity, boxes)
                     if logged_key != "unknown":
                         record_attempt("Desconocido", "DENEGADO", similarity, frame)
+                        if controller.state == LockController.LOCKED and bridge is not None:
+                            try:
+                                bridge.send("DENIED")
+                            except (OSError, TimeoutError, ConnectionError) as exc:
+                                controller.fail(f"ESP32 sin respuesta: {exc}")
+                                publish_lock()
                         logged_key = "unknown"
         except Exception as exc:
             self.events.put(("engine_error", str(exc)))

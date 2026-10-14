@@ -18,23 +18,26 @@ Si ya existe `.venv`, instala los modelos una vez y ejecuta el último comando. 
 
 ## Uso
 
-1. En **Inicio** o **Usuarios**, pulsa **Registrar rostro**. En la ventana, escribe un nombre e inicia la captura. Mantén una sola cara frente a la cámara hasta completar las 20 muestras. Puedes cancelar el registro.
-2. Vuelve a aparecer frente a la cámara. Tras tres lecturas consistentes, el sistema muestra **AUTORIZADO**, la cerradura **DESBLOQUEADA** y el LED **AZUL**.
-3. Un rostro no registrado o varios rostros producen **DENEGADO**, cerradura **BLOQUEADA** y LED **ROJO**. Al no haber rostro, vuelve a **ESCANEANDO** con la cerradura bloqueada. Si la cámara falla, usa **Reintentar cámara**.
-4. En **Usuarios** puedes eliminar un registro tras confirmar la acción. Los registros LBPH previos aparecen como **requiere nuevo enrolamiento**: pulsa **Reenrolar** con el mismo nombre para crear su perfil SFace sin borrar las muestras antiguas. En **Historial** puedes buscar, filtrar, cambiar de página y abrir las capturas. Navegar no reinicia la cámara.
+1. En el primer inicio, crea un **PIN de administrador** de 6 a 12 dígitos. Se guarda con sal y PBKDF2; cinco fallos bloquean el PIN durante 60 segundos. La sesión verificada dura dos minutos. Puedes cambiar el PIN o cerrar la sesión en **Configuración**.
+2. En **Inicio** o **Usuarios**, pulsa **Registrar rostro** e introduce el PIN cuando se solicite. En la ventana, escribe un nombre e inicia la captura. Mantén una sola cara frente a la cámara hasta completar las 20 muestras. Puedes cancelar el registro.
+3. Vuelve a aparecer frente a la cámara. Tras tres lecturas consistentes, el sistema muestra **AUTORIZADO** y ordena abrir solo si la cerradura está en **BLOQUEADA**. Al terminar el tiempo configurado, pasa a **ESPERANDO CIERRE**. Confirma manualmente que la puerta está cerrada y pulsa **Confirmar cierre** para ordenar `LOCK`. Sin sensor, esa confirmación es del operador y no prueba el cierre físico.
+4. Un rostro no registrado o varios rostros producen **DENEGADO**. Si la cámara falla, usa **Reintentar cámara**. Los errores de comunicación dejan la cerradura en **ERROR** e impiden nuevas aperturas hasta reconectar y confirmar el cierre.
+5. En **Usuarios** puedes eliminar un registro tras confirmar la acción con PIN. Los registros LBPH previos aparecen como **requiere nuevo enrolamiento**: pulsa **Reenrolar** con el mismo nombre para crear su perfil SFace sin borrar las muestras antiguas. En **Historial** puedes buscar, filtrar, cambiar de página, abrir capturas y exportar CSV sin fotografías ni vectores biométricos. Navegar no reinicia la cámara.
 
 Cada intento resuelto se registra una vez mientras el rostro permanece visible. El historial se guarda en `datos/historial.db`, las capturas en `datos/capturas/`, los perfiles SFace en `datos/rasgos_sface/` y el índice de usuarios en `datos/usuarios.json`. Las muestras LBPH anteriores de `datos/rostros/` se conservan. Estos archivos contienen datos biométricos: no los publiques en repositorios.
 
-## Simulación y futura WeMos
+## Configuración, simulación y ESP32
 
-El modo predeterminado es `simulacion`: muestra y actualiza los estados sin hardware. El modo `hardware` está preparado para enviar líneas ASCII terminadas en salto de línea a una WeMos por serial: `OPEN`, `LOCK` y `DENIED`.
+El modo predeterminado es `simulacion`. En **Configuración** puedes cambiar el umbral SFace, el índice de cámara (0–9), el tiempo de autorización (3–60 s), el modo y el puerto `COMx`; se guardan en `datos/config.json`. Los argumentos `--mode`, `--port`, `--similarity-threshold`, `--camera-index` y `--authorization-seconds` tienen prioridad en ese inicio. Para hardware instala la dependencia opcional:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install pyserial
 .\.venv\Scripts\python.exe app.py --mode hardware --port COM3
 ```
 
-`pyserial` es opcional y solo se necesita para ese modo. El firmware de la WeMos debe implementar esos tres comandos, la velocidad de **115200 baudios** y una posición bloqueada segura al arrancar. Aún no se incluye firmware ni se ha probado una cerradura física.
+El firmware está en `firmware/SafeBoxESP32/SafeBoxESP32.ino`. Cárgalo con Arduino IDE y soporte **Arduino-ESP32 3.x** para la placa WeMos D1 ESP32-WROOM. Valores iniciales: servo MG90S en GPIO 18, LED azul en 25 y LED rojo en 26; cambia los `#define` antes de compilar si tu cableado difiere. Usa alimentación externa adecuada de 5 V para el servo y masa común con la ESP32; no alimentes el servo desde un GPIO. Ajusta `SAFEBOX_LOCK_US` y `SAFEBOX_OPEN_US` al mecanismo real antes de acoplarlo: el firmware limita ambos pulsos a 1000–2000 µs y **no mueve el servo al arrancar**. El montaje físico aún no se ha probado.
+
+El protocolo serial usa 115200 baudios y líneas `COMANDO SECUENCIA`: `PING`, `OPEN`, `LOCK`, `DENIED` o `IDLE`; la ESP32 responde `ACK SECUENCIA COMANDO` o `ERR SECUENCIA COMANDO`. El ACK confirma la aceptación del comando, **no** el movimiento ni el estado físico de la puerta. Tras conectar en hardware, confirma el cierre desde la aplicación para enviar el primer `LOCK`. En error serial se bloquean nuevas aperturas. `pyserial` solo se necesita en modo hardware.
 
 ## Alcance técnico
 
