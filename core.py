@@ -17,35 +17,72 @@ import cv2
 import numpy as np
 
 
-FACE_SIZE = (160, 160)
-MAX_DISTANCE = 55.0
+MODEL_DIR = Path(__file__).resolve().parent / "models"
+YUNET_FILE = "face_detection_yunet_2023mar.onnx"
+SFACE_FILE = "face_recognition_sface_2021dec_int8.onnx"
+DEFAULT_SIMILARITY_THRESHOLD = 0.363
+ENROLL_SAMPLES = 20
 
 
-def detector() -> cv2.CascadeClassifier:
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
-    if cascade.empty():
-        raise RuntimeError("No se pudo cargar el detector facial de OpenCV")
-    return cascade
+def load_models(model_dir: Path = MODEL_DIR):
+    yunet_path, sface_path = model_dir / YUNET_FILE, model_dir / SFACE_FILE
+    missing = [path.name for path in (yunet_path, sface_path)
+               if not path.is_file() or path.stat().st_size < 100_000]
+    if missing:
+        raise FileNotFoundError(
+            "Faltan modelos ONNX: " + ", ".join(missing) +
+            ". Ejecuta python download_models.py"
+        )
+    try:
+        detector = cv2.FaceDetectorYN.create(
+            str(yunet_path), "", (320, 320), score_threshold=0.8,
+            nms_threshold=0.3, top_k=5000,
+            backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+            target_id=cv2.dnn.DNN_TARGET_CPU,
+        )
+        recognizer = cv2.FaceRecognizerSF.create(
+            str(sface_path), "", backend_id=cv2.dnn.DNN_BACKEND_OPENCV,
+            target_id=cv2.dnn.DNN_TARGET_CPU,
+        )
+    except cv2.error as exc:
+        raise RuntimeError(f"No se pudieron cargar los modelos ONNX: {exc}") from exc
+    return detector, recognizer
 
 
-def extract_face(frame: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
-    x, y, w, h = box
-    face = cv2.cvtColor(frame[y : y + h, x : x + w], cv2.COLOR_BGR2GRAY)
-    face = cv2.resize(face, FACE_SIZE, interpolation=cv2.INTER_AREA)
-    return cv2.equalizeHist(face)
+def detect_faces(detector, frame: np.ndarray) -> np.ndarray:
+    height, width = frame.shape[:2]
+    scale = min(1.0, 480 / width)
+    sample = cv2.resize(frame, (round(width * scale), round(height * scale)),
+                        interpolation=cv2.INTER_AREA) if scale < 1 else frame
+    detector.setInputSize((sample.shape[1], sample.shape[0]))
+    _, faces = detector.detect(sample)
+    if faces is None:
+        return np.empty((0, 15), dtype=np.float32)
+    faces = faces.copy()
+    faces[:, :14] /= scale
+    return faces
+
+
+def extract_feature(recognizer, frame: np.ndarray, face: np.ndarray) -> np.ndarray:
+    aligned = recognizer.alignCrop(frame, face)
+    feature = recognizer.feature(aligned).reshape(-1).astype(np.float32)
+    norm = float(np.linalg.norm(feature))
+    if not np.isfinite(norm) or norm <= 0:
+        raise ValueError("No se pudo extraer un rasgo facial válido")
+    return feature / norm
 
 
 class FaceStore:
     def __init__(self, root: Path):
         self.root = root
         self.faces_dir = root / "rostros"
+        self.features_dir = root / "rasgos_sface"
         self.index_path = root / "usuarios.json"
         self.faces_dir.mkdir(parents=True, exist_ok=True)
+        self.features_dir.mkdir(parents=True, exist_ok=True)
         self.users = self._read_users()
-        self.recognizer = None
-        self.train()
+        self.templates: dict[str, np.ndarray] = {}
+        self._load_templates()
 
     def _read_users(self) -> dict[str, str]:
         if not self.index_path.exists():
@@ -58,57 +95,73 @@ class FaceStore:
             raise ValueError("datos/usuarios.json tiene un formato inválido")
         return data
 
-    def train(self) -> None:
-        images: list[np.ndarray] = []
-        labels: list[int] = []
+    @staticmethod
+    def _medoid(samples: np.ndarray) -> np.ndarray:
+        if samples.ndim != 2 or samples.shape[1] != 128 or not np.isfinite(samples).all():
+            raise ValueError("Rasgos SFace inválidos")
+        norms = np.linalg.norm(samples, axis=1, keepdims=True)
+        if not len(samples) or np.any(norms <= 0):
+            raise ValueError("Rasgos SFace vacíos")
+        normalized = samples / norms
+        centrality = (normalized @ normalized.T).mean(axis=1)
+        return normalized[int(np.argmax(centrality))].astype(np.float32)
+
+    def _load_templates(self) -> None:
         for person_id in self.users:
-            for image_path in sorted((self.faces_dir / person_id).glob("*.png")):
-                image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-                if image is not None and image.shape == FACE_SIZE:
-                    images.append(image)
-                    labels.append(int(person_id))
-        self.recognizer = None
-        if images:
-            recognizer = cv2.face.LBPHFaceRecognizer_create()
-            recognizer.train(images, np.asarray(labels, dtype=np.int32))
-            self.recognizer = recognizer
+            path = self.features_dir / f"{person_id}.npy"
+            if path.is_file():
+                samples = np.load(path, allow_pickle=False)
+                self.templates[person_id] = self._medoid(samples)
 
     def add_person(self, name: str, samples: list[np.ndarray]) -> None:
-        if len(samples) < 20:
+        if len(samples) < ENROLL_SAMPLES:
             raise ValueError("Faltan muestras para registrar el rostro")
-        if any(existing.casefold() == name.casefold() for existing in self.users.values()):
-            raise ValueError("Ese nombre ya está registrado")
-        person_id = str(uuid.uuid4().int % 2_000_000_000)
-        while person_id in self.users:
+        existing_id = next((uid for uid, value in self.users.items()
+                            if value.casefold() == name.casefold()), None)
+        if existing_id in self.templates:
+            raise ValueError("Ese nombre ya tiene un perfil SFace")
+        person_id = existing_id or str(uuid.uuid4().int % 2_000_000_000)
+        while person_id in self.users and existing_id is None:
             person_id = str(uuid.uuid4().int % 2_000_000_000)
-        folder = self.faces_dir / person_id
-        folder.mkdir()
+        matrix = np.asarray(samples, dtype=np.float32)
+        template = self._medoid(matrix)
+        destination = self.features_dir / f"{person_id}.npy"
+        temporary = self.features_dir / f"{person_id}.tmp"
         try:
-            for number, image in enumerate(samples, 1):
-                if image.shape != FACE_SIZE or not cv2.imwrite(
-                    str(folder / f"{number:02d}.png"), image
-                ):
-                    raise OSError("No se pudo guardar una muestra facial")
+            with temporary.open("wb") as file:
+                np.save(file, matrix, allow_pickle=False)
+            temporary.replace(destination)
             updated = {**self.users, person_id: name}
-            temp = self.index_path.with_suffix(".tmp")
-            temp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
-            temp.replace(self.index_path)
+            if existing_id is None:
+                temp = self.index_path.with_suffix(".tmp")
+                temp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+                temp.replace(self.index_path)
             self.users = updated
-            self.train()
+            self.templates[person_id] = template
         except Exception:
-            if person_id not in self.users:
-                shutil.rmtree(folder, ignore_errors=True)
+            temporary.unlink(missing_ok=True)
+            if existing_id is None and person_id not in self.users:
+                destination.unlink(missing_ok=True)
             raise
 
-    def identify(self, face: np.ndarray) -> tuple[str | None, float | None]:
-        if self.recognizer is None:
+    def identify(self, feature: np.ndarray, threshold: float) -> tuple[str | None, float | None]:
+        if not self.templates:
             return None, None
-        label, distance = self.recognizer.predict(face)
-        name = self.users.get(str(label)) if distance <= MAX_DISTANCE else None
-        return name, float(distance)
+        probe = np.asarray(feature, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(probe))
+        if probe.size != 128 or norm <= 0 or not np.isfinite(norm):
+            raise ValueError("Rasgo facial inválido")
+        probe /= norm
+        person_id, similarity = max(
+            ((uid, float(np.dot(probe, template))) for uid, template in self.templates.items()),
+            key=lambda item: item[1],
+        )
+        return (self.users[person_id] if similarity >= threshold else None,
+                similarity)
 
-    def list_people(self) -> list[tuple[str, str]]:
-        return sorted(self.users.items(), key=lambda item: item[1].casefold())
+    def list_people(self) -> list[tuple[str, str, bool]]:
+        return sorted(((uid, name, uid in self.templates) for uid, name in self.users.items()),
+                      key=lambda item: item[1].casefold())
 
     def delete_person(self, person_id: str) -> str:
         if person_id not in self.users:
@@ -119,8 +172,9 @@ class FaceStore:
         temp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(self.index_path)
         self.users = updated
-        self.train()
-        shutil.rmtree(self.faces_dir / person_id)
+        self.templates.pop(person_id, None)
+        (self.features_dir / f"{person_id}.npy").unlink(missing_ok=True)
+        shutil.rmtree(self.faces_dir / person_id, ignore_errors=True)
         return name
 
 
@@ -135,14 +189,16 @@ class AccessHistory:
             "CREATE TABLE IF NOT EXISTS accesos ("
             "id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, usuario TEXT NOT NULL, "
             "resultado TEXT NOT NULL, confianza INTEGER, captura TEXT NOT NULL, "
-            "distancia REAL)"
+            "distancia REAL, similitud REAL)"
         )
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(accesos)")}
         if "distancia" not in columns:
             self.db.execute("ALTER TABLE accesos ADD COLUMN distancia REAL")
+        if "similitud" not in columns:
+            self.db.execute("ALTER TABLE accesos ADD COLUMN similitud REAL")
         self.db.commit()
 
-    def record(self, user: str, result: str, distance: float | None, frame: np.ndarray) -> None:
+    def record(self, user: str, result: str, similarity: float | None, frame: np.ndarray) -> None:
         when = datetime.now().astimezone().isoformat(timespec="seconds")
         filename = f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.jpg"
         path = self.capture_dir / filename
@@ -151,17 +207,17 @@ class AccessHistory:
         try:
             with self.db:
                 self.db.execute(
-                    "INSERT INTO accesos (fecha, usuario, resultado, confianza, captura, distancia) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (when, user, result, None, filename, distance),
+                    "INSERT INTO accesos (fecha, usuario, resultado, confianza, captura, distancia, similitud) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (when, user, result, None, filename, None, similarity),
                 )
         except Exception:
             path.unlink(missing_ok=True)
             raise
 
-    def recent(self, limit: int = 8) -> list[tuple[str, str, str, float | None]]:
+    def recent(self, limit: int = 8) -> list[tuple]:
         return self.db.execute(
-            "SELECT fecha, usuario, resultado, distancia FROM accesos "
+            "SELECT fecha, usuario, resultado, distancia, similitud FROM accesos "
             "ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
 
@@ -169,7 +225,7 @@ class AccessHistory:
                offset: int = 0) -> list[tuple]:
         pattern = "%" + user.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.db.execute(
-            "SELECT fecha, usuario, resultado, distancia, captura FROM accesos "
+            "SELECT fecha, usuario, resultado, distancia, similitud, captura FROM accesos "
             "WHERE usuario LIKE ? ESCAPE '\\' AND (? = 'Todos' OR resultado = ?) "
             "ORDER BY id DESC LIMIT ? OFFSET ?",
             (pattern, result, result, limit, offset),
@@ -218,10 +274,14 @@ class CommandBridge:
 class SafeBackend:
     """La cámara y el motor son dueños de sus recursos; Tk nunca sale del hilo principal."""
 
-    def __init__(self, data_dir: Path, mode: str, port: str | None):
+    def __init__(self, data_dir: Path, mode: str, port: str | None,
+                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
+        if not 0.0 < similarity_threshold < 1.0:
+            raise ValueError("El umbral de similitud debe estar entre 0 y 1")
         self.data_dir = data_dir
         self.mode = mode
         self.port = port
+        self.similarity_threshold = similarity_threshold
         self.events: queue.Queue[tuple] = queue.Queue()
         self.commands: queue.Queue[tuple] = queue.Queue()
         self.camera_commands: queue.Queue[str] = queue.Queue()
@@ -243,7 +303,7 @@ class SafeBackend:
                 return None
             return self.frame_seq, self.frame
 
-    def send(self, kind: str, value: str | None = None) -> None:
+    def send(self, kind: str, value=None) -> None:
         self.commands.put((kind, value))
 
     def retry_camera(self) -> None:
@@ -319,20 +379,20 @@ class SafeBackend:
         samples: list[np.ndarray] = []
         last_sample = 0.0
 
-        def state(name: str, detail: str, user: str = "—", distance: float | None = None,
+        def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
             nonlocal last_state
-            payload = (name, detail, user, distance, tuple(boxes or ()))
+            payload = (name, detail, user, similarity, tuple(boxes or ()))
             if payload != last_state:
-                self.events.put(("state", name, detail, user, distance, list(boxes or ())))
+                self.events.put(("state", name, detail, user, similarity, list(boxes or ())))
                 last_state = payload
             command = "OPEN" if name == "AUTORIZADO" else "DENIED" if name == "DENEGADO" else "LOCK"
             bridge.send(command)
 
-        def record_attempt(user: str, result: str, distance: float | None,
+        def record_attempt(user: str, result: str, similarity: float | None,
                            frame: np.ndarray) -> None:
             try:
-                history.record(user, result, distance, frame)
+                history.record(user, result, similarity, frame)
                 self.events.put(("history", history.recent()))
             except (OSError, sqlite3.Error) as exc:
                 self.events.put(("storage_error", str(exc)))
@@ -340,7 +400,7 @@ class SafeBackend:
         try:
             store = FaceStore(self.data_dir)
             history = AccessHistory(self.data_dir)
-            face_detector = detector()
+            face_detector, face_recognizer = load_models()
             bridge = CommandBridge(self.mode, self.port)
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             while not self.stop_event.is_set():
@@ -353,8 +413,9 @@ class SafeBackend:
                         name = (value or "").strip()
                         if not self.camera_connected:
                             self.events.put(("enroll_error", "La cámara no está disponible"))
-                        elif any(existing.casefold() == name.casefold() for existing in store.users.values()):
-                            self.events.put(("enroll_error", "Ese nombre ya está registrado"))
+                        elif any(uid in store.templates and existing.casefold() == name.casefold()
+                                 for uid, existing in store.users.items()):
+                            self.events.put(("enroll_error", "Ese nombre ya tiene un perfil SFace"))
                         else:
                             enrolling_name = name
                             samples = []
@@ -402,15 +463,8 @@ class SafeBackend:
                     continue
                 last_seq, frame = latest
                 last_analyze = now
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                scale = min(1.0, 480 / gray.shape[1])
-                small = cv2.resize(gray, None, fx=scale, fy=scale,
-                                   interpolation=cv2.INTER_AREA) if scale < 1 else gray
-                found = face_detector.detectMultiScale(
-                    small, scaleFactor=1.1, minNeighbors=5,
-                    minSize=(max(60, int(80 * scale)), max(60, int(80 * scale))),
-                )
-                boxes = [tuple(round(int(v) / scale) for v in box) for box in found]
+                found = detect_faces(face_detector, frame)
+                boxes = [tuple(round(float(v)) for v in face[:4]) for face in found]
                 count = len(boxes)
                 if count == 0:
                     candidate_name, streak = None, 0
@@ -432,17 +486,22 @@ class SafeBackend:
                             record_attempt("Varios rostros", "DENEGADO", None, frame)
                             logged_key = "multiple"
                     continue
-                face = extract_face(frame, boxes[0])
+                try:
+                    feature = extract_feature(face_recognizer, frame, found[0])
+                except (cv2.error, ValueError):
+                    candidate_name, streak = None, 0
+                    state("VERIFICANDO", "Ajusta el rostro frente a la cámara", boxes=boxes)
+                    continue
                 if enrolling_name:
                     if now - last_sample >= 0.25:
-                        samples.append(face)
+                        samples.append(feature)
                         last_sample = now
                         self.events.put(("enroll_progress", len(samples)))
-                    state("REGISTRANDO", f"Capturando · {len(samples)}/20", enrolling_name, boxes=boxes)
-                    if len(samples) >= 20:
+                    state("REGISTRANDO", f"Capturando · {len(samples)}/{ENROLL_SAMPLES}", enrolling_name, boxes=boxes)
+                    if len(samples) >= ENROLL_SAMPLES:
                         name = enrolling_name
                         enrolling_name = None
-                        state("VERIFICANDO", "Guardando y entrenando el modelo…")
+                        state("VERIFICANDO", "Guardando perfil SFace…")
                         try:
                             store.add_person(name, samples)
                         except Exception as exc:
@@ -452,23 +511,23 @@ class SafeBackend:
                         samples = []
                         candidate_name, streak = None, 0
                     continue
-                name, distance = store.identify(face)
+                name, similarity = store.identify(feature, self.similarity_threshold)
                 identity = name or "Desconocido"
                 streak = streak + 1 if identity == candidate_name else 1
                 candidate_name = identity
                 if streak < 3:
-                    state("VERIFICANDO", f"Lectura {streak}/3", distance=distance, boxes=boxes)
+                    state("VERIFICANDO", f"Lectura {streak}/3", similarity=similarity, boxes=boxes)
                 elif name is not None:
-                    state("AUTORIZADO", "Coincidencia confirmada", name, distance, boxes)
+                    state("AUTORIZADO", "Coincidencia confirmada", name, similarity, boxes)
                     key = f"allow:{name}"
                     if logged_key != key:
-                        record_attempt(name, "AUTORIZADO", distance, frame)
+                        record_attempt(name, "AUTORIZADO", similarity, frame)
                         logged_key = key
                 else:
-                    detail = "Rostro no registrado" if distance is not None else "No hay usuarios registrados"
-                    state("DENEGADO", detail, "Desconocido", distance, boxes)
+                    detail = "Rostro no registrado" if similarity is not None else "No hay perfiles SFace activos"
+                    state("DENEGADO", detail, "Desconocido", similarity, boxes)
                     if logged_key != "unknown":
-                        record_attempt("Desconocido", "DENEGADO", distance, frame)
+                        record_attempt("Desconocido", "DENEGADO", similarity, frame)
                         logged_key = "unknown"
         except Exception as exc:
             self.events.put(("engine_error", str(exc)))

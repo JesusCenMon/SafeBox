@@ -15,11 +15,12 @@ import customtkinter as ctk
 import numpy as np
 from PIL import Image, ImageTk
 
-from core import MAX_DISTANCE, SafeBackend, detector
+from core import (DEFAULT_SIMILARITY_THRESHOLD, ENROLL_SAMPLES, SafeBackend,
+                  detect_faces, load_models)
 
 
 BASE = Path(__file__).resolve().parent
-SAMPLES_REQUIRED = 20
+SAMPLES_REQUIRED = ENROLL_SAMPLES
 
 BG = "#121212"
 SURFACE = "#181818"
@@ -40,6 +41,7 @@ STATE_COLORS = {
     "AUTORIZADO": CYAN,
     "DENEGADO": RED,
     "CÁMARA DESCONECTADA": AMBER,
+    "ERROR DE MODELO": RED,
 }
 
 
@@ -51,19 +53,21 @@ def mix_color(start: str, end: str, amount: float) -> str:
 
 
 class SafeApp(ctk.CTk):
-    def __init__(self, data_dir: Path, mode: str, port: str | None):
+    def __init__(self, data_dir: Path, mode: str, port: str | None,
+                 similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
         super().__init__(fg_color=BG)
         self.title("SAFEBOX AI · Dashboard biométrico")
         self.geometry("1220x720+40+30")
         self.minsize(980, 650)
 
-        self.backend = SafeBackend(data_dir, mode, port)
+        self.backend = SafeBackend(data_dir, mode, port, similarity_threshold)
+        self.similarity_threshold = similarity_threshold
         self.mode = mode
         self.running = True
         self.camera_connected = False
         self.backend_ready = False
         self.known_users: list[str] = []
-        self.people: list[tuple[str, str]] = []
+        self.people: list[tuple[str, str, bool]] = []
         self.history_rows: list[tuple] = []
         self.history_results: list[tuple] = []
         self.history_offset = 0
@@ -243,14 +247,14 @@ class SafeApp(ctk.CTk):
         metric = ctk.CTkFrame(identity, fg_color=SURFACE_2, corner_radius=10)
         metric.grid(row=3, column=0, sticky="ew", padx=17, pady=(0, 16))
         metric.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(metric, text="DISTANCIA LBPH", text_color=MUTED,
+        ctk.CTkLabel(metric, text="SIMILITUD COSENO · SFACE", text_color=MUTED,
                      font=ctk.CTkFont("Segoe UI", 10, "bold")).grid(
             row=0, column=0, sticky="w", padx=14, pady=(10, 0)
         )
         self.distance_label = ctk.CTkLabel(metric, text="—", text_color=TEXT,
                                             font=ctk.CTkFont("Consolas", 21, "bold"))
         self.distance_label.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
-        ctk.CTkLabel(metric, text=f"UMBRAL  ≤ {MAX_DISTANCE:.1f}   ·   MENOR ES MEJOR",
+        ctk.CTkLabel(metric, text=f"UMBRAL  ≥ {self.similarity_threshold:.3f}   ·   MAYOR ES MEJOR",
                      text_color=MUTED, font=ctk.CTkFont("Consolas", 9)).grid(
             row=0, column=1, rowspan=2, sticky="e", padx=14
         )
@@ -389,14 +393,16 @@ class SafeApp(ctk.CTk):
             row=0, column=0, sticky="w", padx=24, pady=(16, 8))
         self.settings_camera = self.setting_line(settings_card, 1, "Cámara", "Iniciando…")
         self.settings_engine = self.setting_line(settings_card, 2, "Reconocimiento", "Iniciando…")
-        self.setting_line(settings_card, 3, "Modelo facial", "OpenCV LBPH · local")
+        self.setting_line(settings_card, 3, "Modelo facial",
+                          f"YuNet + SFace · CPU · umbral ≥ {self.similarity_threshold:.3f}")
         mode_text = "Simulación · sin hardware conectado" if self.mode == "simulacion" else f"Hardware · {self.backend.port}"
         self.setting_line(settings_card, 4, "Modo", mode_text)
         self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
-        ctk.CTkButton(settings_card, text="Reintentar cámara", width=170,
-                      height=38, corner_radius=20, fg_color=SURFACE_2,
-                      hover_color=BORDER, text_color=TEXT,
-                      command=self.open_camera).grid(row=6, column=0, sticky="w", padx=24, pady=(12, 8))
+        self.settings_retry = ctk.CTkButton(
+            settings_card, text="Reintentar cámara", width=170,
+            height=38, corner_radius=20, fg_color=SURFACE_2,
+            hover_color=BORDER, text_color=TEXT, command=self.open_camera)
+        self.settings_retry.grid(row=6, column=0, sticky="w", padx=24, pady=(12, 8))
         ctk.CTkLabel(settings_card,
                      text="Los comandos WeMos solo se envían al iniciar con --mode hardware --port COMx.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
@@ -453,17 +459,27 @@ class SafeApp(ctk.CTk):
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
                 anchor="w", padx=12, pady=24)
             return
-        for person_id, name in self.people:
+        for person_id, name, active in self.people:
             item = ctk.CTkFrame(self.users_list, fg_color=SURFACE_2, corner_radius=12)
             item.pack(fill="x", pady=5)
             item.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(item, text=f"●  {name}", text_color=TEXT,
+            ctk.CTkLabel(item, text=f"●  {name}", text_color=TEXT if active else AMBER,
                          font=ctk.CTkFont("Segoe UI", 13, "bold")).grid(
-                row=0, column=0, sticky="w", padx=18, pady=16)
+                row=0, column=0, sticky="w", padx=18, pady=(9, 0))
+            ctk.CTkLabel(item,
+                         text="SFace activo" if active else "Registro LBPH anterior · requiere nuevo enrolamiento",
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
+                row=1, column=0, sticky="w", padx=18, pady=(0, 9))
+            if not active:
+                ctk.CTkButton(item, text="Reenrolar", width=95, height=32,
+                              corner_radius=17, fg_color=CYAN, hover_color="#1DB954",
+                              text_color=BG,
+                              command=lambda label=name: self.open_registration(label)).grid(
+                    row=0, column=1, rowspan=2, padx=(4, 0))
             ctk.CTkButton(item, text="Eliminar", width=95, height=32,
                           corner_radius=17, fg_color="#423035", hover_color="#653B44",
                           text_color=RED, command=lambda uid=person_id, label=name:
-                          self.confirm_delete(uid, label)).grid(row=0, column=1, padx=14)
+                          self.confirm_delete(uid, label)).grid(row=0, column=2, rowspan=2, padx=14)
 
     def confirm_delete(self, person_id: str, name: str) -> None:
         window = ctk.CTkToplevel(self, fg_color=BG)
@@ -529,7 +545,7 @@ class SafeApp(ctk.CTk):
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
                 anchor="w", padx=10, pady=22)
             return
-        for date, user, result, distance, capture in rows:
+        for date, user, result, distance, similarity, capture in rows:
             item = ctk.CTkFrame(self.history_full_list, fg_color=SURFACE_2, corner_radius=12)
             item.pack(fill="x", pady=4)
             item.grid_columnconfigure(0, weight=1)
@@ -540,7 +556,8 @@ class SafeApp(ctk.CTk):
             ctk.CTkLabel(item, text=result, text_color=color,
                          font=ctk.CTkFont("Segoe UI", 11, "bold")).grid(
                 row=0, column=1, sticky="e", padx=12, pady=(9, 0))
-            metric = f" · LBPH {distance:.1f}" if distance is not None else ""
+            metric = (f" · SFace coseno {similarity:.3f}" if similarity is not None
+                      else f" · LBPH distancia {distance:.1f}" if distance is not None else "")
             ctk.CTkLabel(item, text=date[:19].replace("T", "  ") + metric,
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
                 row=1, column=0, sticky="w", padx=16, pady=(0, 9))
@@ -620,10 +637,14 @@ class SafeApp(ctk.CTk):
                            fill=BORDER, width=2, tags="placeholder")
         loading = self.status_state == "INICIANDO"
         canvas.create_text(cx, cy + 55,
-                           text="INICIANDO CÁMARA" if loading else "CÁMARA SIN SEÑAL", fill=TEXT,
+                           text="INICIANDO CÁMARA" if loading else
+                           "MODELO NO DISPONIBLE" if self.status_state == "ERROR DE MODELO" else
+                           "CÁMARA SIN SEÑAL", fill=TEXT,
                            font=("Segoe UI", 17, "bold"), tags="placeholder")
         canvas.create_text(cx, cy + 82,
-                           text="Preparando captura…" if loading else "Usa «Reintentar cámara» al conectar el dispositivo",
+                           text="Preparando captura…" if loading else
+                           "Ejecuta download_models.py y reinicia" if self.status_state == "ERROR DE MODELO" else
+                           "Usa «Reintentar cámara» al conectar el dispositivo",
                            fill=MUTED, font=("Segoe UI", 10), tags="placeholder")
 
     def animate_state_color(self, start: str, target: str, step: int = 0) -> None:
@@ -639,7 +660,7 @@ class SafeApp(ctk.CTk):
             self.transition_job = None
 
     def set_state(
-        self, state: str, detail: str, user: str = "—", distance: float | None = None
+        self, state: str, detail: str, user: str = "—", similarity: float | None = None
     ) -> None:
         color = STATE_COLORS[state]
         if state != self.status_state:
@@ -659,13 +680,14 @@ class SafeApp(ctk.CTk):
             "AUTORIZADO": "Identidad verificada",
             "DENEGADO": "Acceso denegado",
             "CÁMARA DESCONECTADA": "Cámara sin señal",
+            "ERROR DE MODELO": "Reconocimiento no disponible",
         }[state]
         self.identity_title.configure(text=title)
         self.detail_label.configure(text=detail)
-        self.distance_label.configure(text=f"{distance:.1f}" if distance is not None else "—")
+        self.distance_label.configure(text=f"{similarity:.3f}" if similarity is not None else "—")
         scan_text = f"{state} · {user}" if user != "—" else state
-        if distance is not None:
-            scan_text += f" · LBPH {distance:.1f}"
+        if similarity is not None:
+            scan_text += f" · coseno {similarity:.3f}"
         self.scan_result.configure(text=scan_text, text_color=color)
         unlocked = state == "AUTORIZADO"
         self.lock_value.configure(text="DESBLOQUEADA" if unlocked else "BLOQUEADA",
@@ -673,7 +695,7 @@ class SafeApp(ctk.CTk):
         led = "AZUL" if unlocked else "ROJO" if state == "DENEGADO" else "APAGADO"
         self.led_value.configure(text=led, text_color=BLUE if led == "AZUL" else RED if led == "ROJO" else MUTED)
 
-    def open_registration(self) -> None:
+    def open_registration(self, name: str = "") -> None:
         if self.register_window is not None and self.register_window.winfo_exists():
             self.register_window.focus()
             return
@@ -701,6 +723,8 @@ class SafeApp(ctk.CTk):
             corner_radius=22,
         )
         self.register_entry.grid(row=2, column=0, sticky="ew", padx=28, pady=(23, 15))
+        if name:
+            self.register_entry.insert(0, name)
         self.enrollment_progress = ctk.CTkProgressBar(
             window, height=7, progress_color=CYAN, fg_color=SURFACE_2,
         )
@@ -736,8 +760,9 @@ class SafeApp(ctk.CTk):
         if not self.backend_ready:
             self.enrollment_hint.configure(text="El motor facial aún está iniciando.", text_color=AMBER)
             return
-        if any(existing.casefold() == name.casefold() for existing in self.known_users):
-            self.enrollment_hint.configure(text="Ese nombre ya está registrado.", text_color=RED)
+        if any(active and existing.casefold() == name.casefold()
+               for _, existing, active in self.people):
+            self.enrollment_hint.configure(text="Ese nombre ya tiene un perfil SFace.", text_color=RED)
             return
         if not self.camera_connected:
             self.enrollment_hint.configure(text="La cámara no está disponible.", text_color=RED)
@@ -771,7 +796,7 @@ class SafeApp(ctk.CTk):
                 text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
             ).pack(anchor="w", padx=8, pady=12)
             return
-        for date, user, result, distance in rows:
+        for date, user, result, distance, similarity in rows:
             item = ctk.CTkFrame(self.history_list, fg_color=SURFACE_2, corner_radius=8)
             item.pack(fill="x", pady=(0, 6))
             item.grid_columnconfigure(0, weight=1)
@@ -784,7 +809,8 @@ class SafeApp(ctk.CTk):
                          font=ctk.CTkFont("Segoe UI", 9, "bold")).grid(
                 row=0, column=1, sticky="e", padx=10, pady=(6, 0)
             )
-            metric = f"  ·  LBPH {distance:.1f}" if distance is not None else ""
+            metric = (f"  ·  SFace {similarity:.3f}" if similarity is not None
+                      else f"  ·  LBPH {distance:.1f}" if distance is not None else "")
             ctk.CTkLabel(item, text=date[:10] + "  " + date[11:19] + metric,
                          text_color=MUTED, font=ctk.CTkFont("Consolas", 9)).grid(
                 row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 6)
@@ -807,7 +833,7 @@ class SafeApp(ctk.CTk):
                 self.update_user_count()
                 self.refresh_history()
                 self.refresh_users()
-                self.settings_engine.configure(text="Listo · LBPH activo", text_color=CYAN)
+                self.settings_engine.configure(text="Listo · YuNet + SFace", text_color=CYAN)
                 if self.mode == "hardware":
                     self.mode_badge.configure(text="●  HARDWARE CONECTADO", text_color=CYAN)
                 if self.current_page == "Historial":
@@ -815,6 +841,8 @@ class SafeApp(ctk.CTk):
                 if self.camera_connected:
                     self.set_state("ESCANEANDO", "Esperando un rostro frente a la cámara")
             elif kind == "camera":
+                if self.status_state == "ERROR DE MODELO":
+                    continue
                 self.camera_connected = event[1]
                 if self.camera_connected:
                     self.camera_badge.configure(text="●  EN VIVO", text_color=CYAN)
@@ -857,10 +885,10 @@ class SafeApp(ctk.CTk):
                 self.refresh_users()
             elif kind == "user_deleted":
                 self.people = event[2]
-                self.known_users = [name for _, name in self.people]
+                self.known_users = [name for _, name, _ in self.people]
                 self.update_user_count()
                 self.refresh_users()
-                self.notify(f"Se eliminó a {event[1]} y se actualizó el modelo.")
+                self.notify(f"Se eliminó a {event[1]} y se actualizó el registro.")
             elif kind == "user_error":
                 self.notify(event[1], error=True)
             elif kind == "enroll_started":
@@ -869,7 +897,7 @@ class SafeApp(ctk.CTk):
             elif kind == "enroll_progress":
                 if self.register_window is not None and self.register_window.winfo_exists():
                     self.enrollment_progress.set(event[1] / SAMPLES_REQUIRED)
-                    label = "Guardando y entrenando…" if event[1] >= SAMPLES_REQUIRED else f"{event[1]} / {SAMPLES_REQUIRED} muestras"
+                    label = "Guardando perfil SFace…" if event[1] >= SAMPLES_REQUIRED else f"{event[1]} / {SAMPLES_REQUIRED} muestras"
                     self.enrollment_hint.configure(text=label)
             elif kind == "enroll_done":
                 self.known_users = event[2]
@@ -889,8 +917,17 @@ class SafeApp(ctk.CTk):
                 self.notify(f"No se guardó el intento: {event[1]}", error=True)
             elif kind == "engine_error":
                 self.backend_ready = False
-                self.detail_label.configure(text=f"Error del motor: {event[1]}")
-                self.settings_engine.configure(text="Error de motor", text_color=RED)
+                self.set_state("ERROR DE MODELO", event[1])
+                self.settings_engine.configure(text=event[1], text_color=RED)
+                self.camera_badge.configure(text="●  RECONOCIMIENTO DETENIDO", text_color=RED)
+                self.retry_button.configure(state="disabled")
+                self.settings_retry.configure(state="disabled")
+                self.camera_connected = False
+                self.camera_canvas.itemconfigure(self.image_item, image="")
+                self.photo = None
+                self.boxes = []
+                self.position_boxes()
+                self.draw_placeholder()
                 if self.mode == "hardware":
                     self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
                 self.backend.stop()
@@ -990,14 +1027,14 @@ class SafeApp(ctk.CTk):
 
 
 def self_test() -> None:
-    detector()
-    model = cv2.face.LBPHFaceRecognizer_create()
-    image = np.tile(np.arange(160, dtype=np.uint8), (160, 1))
-    model.train([image], np.array([7], dtype=np.int32))
-    label, _ = model.predict(image)
-    if label != 7:
-        raise RuntimeError("Falló el reconocedor LBPH")
-    print(f"OK: OpenCV {cv2.__version__}, CustomTkinter {ctk.__version__}, Pillow y LBPH")
+    face_detector, recognizer = load_models()
+    blank = np.zeros((320, 320, 3), dtype=np.uint8)
+    if len(detect_faces(face_detector, blank)):
+        raise RuntimeError("YuNet detectó un rostro en una imagen vacía")
+    feature = recognizer.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+    if feature.size != 128 or not np.isfinite(feature).all():
+        raise RuntimeError("SFace no produjo un vector válido")
+    print(f"OK: OpenCV {cv2.__version__}, CustomTkinter {ctk.__version__}, YuNet + SFace CPU")
 
 
 def main() -> None:
@@ -1006,13 +1043,19 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=BASE / "datos")
     parser.add_argument("--mode", choices=("simulacion", "hardware"), default="simulacion")
     parser.add_argument("--port", help="puerto de la WeMos, por ejemplo COM3")
+    parser.add_argument("--similarity-threshold", type=float,
+                        default=DEFAULT_SIMILARITY_THRESHOLD,
+                        help="umbral coseno SFace entre 0 y 1 (predeterminado: 0.363)")
     args = parser.parse_args()
     if args.self_test:
-        self_test()
+        try:
+            self_test()
+        except (FileNotFoundError, RuntimeError, cv2.error) as exc:
+            raise SystemExit(f"Prueba fallida: {exc}") from exc
         return
     ctk.set_appearance_mode("dark")
     try:
-        app = SafeApp(args.data_dir, args.mode, args.port)
+        app = SafeApp(args.data_dir, args.mode, args.port, args.similarity_threshold)
     except Exception as exc:
         raise SystemExit(f"No se pudo iniciar SAFEBOX AI: {exc}") from exc
     app.mainloop()
