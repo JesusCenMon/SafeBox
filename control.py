@@ -80,14 +80,75 @@ class AdminManager:
         self.data = data
 
 
+class AccessPinStore:
+    """PIN de acceso independiente por identidad; no se almacena texto plano."""
+
+    def __init__(self, root: Path):
+        self.path = root / "access_pins.json"
+        self.data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        if not isinstance(self.data, dict):
+            raise ValueError("El archivo de PIN de acceso es inválido")
+
+    def has_pin(self, person_id: str) -> bool:
+        return person_id in self.data
+
+    def ids(self) -> list[str]:
+        return list(self.data)
+
+    def set_pin(self, person_id: str, pin: str) -> None:
+        if not person_id or not person_id.isdecimal():
+            raise ValueError("Identidad inválida")
+        AdminManager._validate(pin)
+        salt = os.urandom(32)
+        record = {"salt": salt.hex(), "hash": AdminManager._digest(pin, salt),
+                  "iterations": PIN_ITERATIONS, "failures": 0, "locked_until": 0.0}
+        updated = {**self.data, person_id: record}
+        _atomic_json(self.path, updated)
+        self.data = updated
+
+    def verify(self, person_id: str, pin: str) -> None:
+        record = self.data.get(person_id)
+        if record is None:
+            raise PermissionError("Esta identidad no tiene PIN de acceso")
+        now = time.time()
+        if now < record["locked_until"]:
+            raise PermissionError(f"PIN bloqueado; espera {int(record['locked_until'] - now) + 1} s")
+        salt = bytes.fromhex(record["salt"])
+        valid = pin.isascii() and hmac.compare_digest(
+            AdminManager._digest(pin, salt), record["hash"])
+        updated_record = dict(record)
+        if valid:
+            updated_record["failures"] = 0
+            updated_record["locked_until"] = 0.0
+        else:
+            updated_record["failures"] += 1
+            if updated_record["failures"] >= MAX_PIN_FAILURES:
+                updated_record["failures"] = 0
+                updated_record["locked_until"] = now + PIN_LOCK_SECONDS
+        updated = {**self.data, person_id: updated_record}
+        _atomic_json(self.path, updated)
+        self.data = updated
+        if not valid:
+            raise PermissionError("PIN de acceso incorrecto o bloqueado temporalmente")
+
+    def remove(self, person_id: str) -> None:
+        if person_id in self.data:
+            updated = {key: value for key, value in self.data.items() if key != person_id}
+            _atomic_json(self.path, updated)
+            self.data = updated
+
+
 class SettingsStore:
-    DEFAULTS = {"similarity_threshold": 0.363, "camera_index": 0,
+    DEFAULTS = {"similarity_threshold": 0.5, "camera_index": 0,
                 "authorization_seconds": 8, "mode": "simulacion", "port": ""}
 
     def __init__(self, root: Path):
         self.path = root / "config.json"
         saved = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
         self.values = {**self.DEFAULTS, **saved}
+        threshold = self.values["similarity_threshold"]
+        if isinstance(threshold, (int, float)):
+            self.values["similarity_threshold"] = max(0.5, threshold)
         self.validate(self.values)
 
     @staticmethod
@@ -97,8 +158,8 @@ class SettingsStore:
         camera = values["camera_index"]
         mode = values["mode"]
         port = values["port"]
-        if not isinstance(threshold, (int, float)) or not 0.1 <= threshold <= 0.9:
-            raise ValueError("Umbral: usa un valor entre 0.1 y 0.9")
+        if not isinstance(threshold, (int, float)) or not 0.5 <= threshold <= 0.9:
+            raise ValueError("Umbral: usa un valor entre 0.5 y 0.9")
         if not isinstance(duration, int) or not 3 <= duration <= 60:
             raise ValueError("Tiempo de autorización: 3 a 60 segundos")
         if not isinstance(camera, int) or not 0 <= camera <= 9:

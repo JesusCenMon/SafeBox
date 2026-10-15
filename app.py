@@ -39,6 +39,7 @@ STATE_COLORS = {
     "INICIANDO": BLUE,
     "ESCANEANDO": MUTED,
     "VERIFICANDO": BLUE,
+    "PIN REQUERIDO": AMBER,
     "REGISTRANDO": BLUE,
     "AUTORIZADO": CYAN,
     "DENEGADO": RED,
@@ -83,6 +84,9 @@ class SafeApp(ctk.CTk):
         self.backend_ready = False
         self.known_users: list[str] = []
         self.people: list[tuple[str, str, bool]] = []
+        self.access_pin_ids: set[str] = set()
+        self.access_window = None
+        self.access_request = None
         self.history_rows: list[tuple] = []
         self.history_results: list[tuple] = []
         self.history_offset = 0
@@ -446,7 +450,7 @@ class SafeApp(ctk.CTk):
         ctk.CTkButton(actions, text="Guardar ajustes y comprobar conexión", width=265,
                       height=38, corner_radius=20, fg_color=CYAN, hover_color="#1DB954",
                       text_color=BG, command=self.save_settings).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Cambiar PIN", width=105, height=38, corner_radius=20,
+        ctk.CTkButton(actions, text="Cambiar PIN admin", width=145, height=38, corner_radius=20,
                       fg_color=SURFACE_2, hover_color=BORDER, command=self.change_pin).pack(side="left", padx=4)
         ctk.CTkButton(actions, text="Cerrar sesión", width=120, height=38, corner_radius=20,
                       fg_color=SURFACE_2, hover_color=BORDER, command=self.lock_admin_session).pack(side="left", padx=4)
@@ -529,8 +533,10 @@ class SafeApp(ctk.CTk):
             ctk.CTkLabel(item, text=f"●  {name}", text_color=TEXT if active else AMBER,
                          font=ctk.CTkFont("Segoe UI", 13, "bold")).grid(
                 row=0, column=0, sticky="w", padx=18, pady=(9, 0))
+            pin_text = "PIN de acceso activo" if person_id in self.access_pin_ids else "PIN de acceso pendiente"
             ctk.CTkLabel(item,
-                         text="SFace activo" if active else "Registro LBPH anterior · requiere nuevo enrolamiento",
+                         text=(f"SFace activo · {pin_text}" if active else
+                               f"Registro LBPH anterior · requiere nuevo enrolamiento · {pin_text}"),
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
                 row=1, column=0, sticky="w", padx=18, pady=(0, 9))
             if not active:
@@ -539,10 +545,15 @@ class SafeApp(ctk.CTk):
                               text_color=BG,
                               command=lambda label=name: self.open_registration(label)).grid(
                     row=0, column=1, rowspan=2, padx=(4, 0))
+            ctk.CTkButton(item, text="PIN acceso", width=95, height=32,
+                          corner_radius=17, fg_color=SURFACE, hover_color=BORDER,
+                          text_color=TEXT, command=lambda uid=person_id, label=name:
+                          self.require_admin("PIN de acceso", lambda: self.set_access_pin(uid, label))).grid(
+                    row=0, column=2, rowspan=2, padx=(4, 0))
             ctk.CTkButton(item, text="Eliminar", width=95, height=32,
                           corner_radius=17, fg_color="#423035", hover_color="#653B44",
                           text_color=RED, command=lambda uid=person_id, label=name:
-                          self.confirm_delete(uid, label)).grid(row=0, column=2, rowspan=2, padx=14)
+                          self.confirm_delete(uid, label)).grid(row=0, column=3, rowspan=2, padx=14)
 
     def confirm_delete(self, person_id: str, name: str, authorized: bool = False) -> None:
         if not authorized:
@@ -702,6 +713,85 @@ class SafeApp(ctk.CTk):
                 self.notify("PIN actualizado; sesión bloqueada")
             self.submit_admin(lambda: self.admin.change(old_pin, new_pin), done, error, button)
         button.configure(command=submit)
+
+    def set_access_pin(self, person_id: str, name: str) -> None:
+        window = self.pin_window(f"PIN de acceso · {name}", 280)
+        if window is None:
+            return
+        window.protocol("WM_DELETE_WINDOW", self.close_pin_window)
+        first = ctk.CTkEntry(window, placeholder_text="PIN de acceso · 6 a 12 dígitos",
+                             show="•", height=40, corner_radius=20)
+        first.grid(row=1, column=0, sticky="ew", padx=26, pady=6)
+        second = ctk.CTkEntry(window, placeholder_text="Repetir PIN de acceso",
+                              show="•", height=40, corner_radius=20)
+        second.grid(row=2, column=0, sticky="ew", padx=26, pady=6)
+        hint = ctk.CTkLabel(window, text="Este PIN se pedirá después del rostro.", text_color=MUTED)
+        hint.grid(row=3, column=0, sticky="w", padx=26, pady=5)
+        def save() -> None:
+            pin = first.get()
+            if pin != second.get() or not re.fullmatch(r"[0-9]{6,12}", pin):
+                hint.configure(text="Los PIN deben coincidir y tener 6 a 12 dígitos", text_color=RED)
+                return
+            self.backend.send("set_access_pin", (person_id, pin))
+            self.close_pin_window()
+        ctk.CTkButton(window, text="Guardar PIN", height=40, corner_radius=20,
+                      fg_color=CYAN, hover_color="#1DB954", text_color=BG,
+                      command=save).grid(row=4, column=0, sticky="ew", padx=26, pady=8)
+        first.focus_set()
+
+    def show_access_pin(self, person_id: str, name: str) -> None:
+        if (self.admin_window is not None and self.admin_window.winfo_exists()) or (
+                self.register_window is not None and self.register_window.winfo_exists()):
+            self.backend.send("cancel_access")
+            return
+        self.close_access_pin(False)
+        window = ctk.CTkToplevel(self, fg_color=BG)
+        self.access_window = window
+        self.access_request = person_id
+        window.title("SAFEBOX AI · Segundo factor")
+        window.geometry("420x245")
+        window.resizable(False, False)
+        window.transient(self)
+        window.grab_set()
+        window.grid_columnconfigure(0, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close_access_pin)
+        ctk.CTkLabel(window, text="Confirmar acceso", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 21, "bold")).grid(
+            row=0, column=0, sticky="w", padx=26, pady=(22, 5))
+        ctk.CTkLabel(window, text=f"Posible coincidencia: {name}. Mantén el rostro en cámara.",
+                     text_color=MUTED, wraplength=370).grid(row=1, column=0, sticky="w", padx=26)
+        self.access_entry = ctk.CTkEntry(window, placeholder_text="PIN de acceso", show="•",
+                                         height=40, corner_radius=20)
+        self.access_entry.grid(row=2, column=0, sticky="ew", padx=26, pady=10)
+        self.access_error = ctk.CTkLabel(window, text="Tiempo máximo: 15 segundos", text_color=MUTED)
+        self.access_error.grid(row=3, column=0, sticky="w", padx=26)
+        self.access_button = ctk.CTkButton(window, text="Verificar y abrir", height=40,
+                                           corner_radius=20, fg_color=CYAN,
+                                           hover_color="#1DB954", text_color=BG,
+                                           command=self.submit_access_pin)
+        self.access_button.grid(row=4, column=0, sticky="ew", padx=26, pady=(6, 10))
+        self.access_entry.bind("<Return>", lambda _event: self.submit_access_pin())
+        self.access_entry.focus_set()
+
+    def submit_access_pin(self) -> None:
+        if self.access_request is None:
+            return
+        pin = self.access_entry.get()
+        if not re.fullmatch(r"[0-9]{6,12}", pin):
+            self.access_error.configure(text="Introduce 6 a 12 dígitos", text_color=RED)
+            return
+        self.access_button.configure(state="disabled")
+        self.backend.send("access_pin", (self.access_request, pin))
+
+    def close_access_pin(self, cancel: bool = True) -> None:
+        if cancel and self.access_request is not None:
+            self.backend.send("cancel_access")
+        if self.access_window is not None and self.access_window.winfo_exists():
+            self.access_entry.delete(0, "end")
+            self.access_window.grab_release()
+            self.access_window.destroy()
+        self.access_window = None
+        self.access_request = None
 
     def lock_admin_session(self) -> None:
         self.admin_until = 0.0
@@ -922,6 +1012,7 @@ class SafeApp(ctk.CTk):
             "INICIANDO": "Iniciando sistema",
             "ESCANEANDO": "Esperando identidad",
             "VERIFICANDO": "Verificando rostro",
+            "PIN REQUERIDO": "Verificación en dos pasos",
             "REGISTRANDO": "Capturando rostro",
             "AUTORIZADO": "Identidad verificada",
             "DENEGADO": "Acceso denegado",
@@ -964,7 +1055,7 @@ class SafeApp(ctk.CTk):
         window = ctk.CTkToplevel(self, fg_color=BG)
         self.register_window = window
         window.title("SAFEBOX AI · Nuevo usuario")
-        window.geometry("440x320")
+        window.geometry("440x420")
         window.resizable(False, False)
         window.transient(self)
         window.grab_set()
@@ -987,18 +1078,24 @@ class SafeApp(ctk.CTk):
         self.register_entry.grid(row=2, column=0, sticky="ew", padx=28, pady=(23, 15))
         if name:
             self.register_entry.insert(0, name)
+        self.register_pin = ctk.CTkEntry(window, placeholder_text="PIN de acceso · 6 a 12 dígitos",
+                                          show="•", height=40, corner_radius=20)
+        self.register_pin.grid(row=3, column=0, sticky="ew", padx=28, pady=(0, 8))
+        self.register_pin_confirm = ctk.CTkEntry(window, placeholder_text="Repetir PIN de acceso",
+                                                  show="•", height=40, corner_radius=20)
+        self.register_pin_confirm.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 12))
         self.enrollment_progress = ctk.CTkProgressBar(
             window, height=7, progress_color=CYAN, fg_color=SURFACE_2,
         )
-        self.enrollment_progress.grid(row=3, column=0, sticky="ew", padx=28)
+        self.enrollment_progress.grid(row=5, column=0, sticky="ew", padx=28)
         self.enrollment_progress.set(0)
         self.enrollment_hint = ctk.CTkLabel(
             window, text="0 / 20 muestras", text_color=MUTED,
             font=ctk.CTkFont("Consolas", 11),
         )
-        self.enrollment_hint.grid(row=4, column=0, sticky="w", padx=28, pady=(8, 18))
+        self.enrollment_hint.grid(row=6, column=0, sticky="w", padx=28, pady=(8, 18))
         actions = ctk.CTkFrame(window, fg_color="transparent")
-        actions.grid(row=5, column=0, sticky="ew", padx=28)
+        actions.grid(row=7, column=0, sticky="ew", padx=28)
         actions.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(actions, text="Cancelar", height=39, fg_color=SURFACE_2,
                       hover_color=BORDER, text_color=TEXT,
@@ -1019,6 +1116,10 @@ class SafeApp(ctk.CTk):
             self.require_admin("Registrar rostro", lambda: self.start_enrollment(True))
             return
         name = self.register_entry.get().strip()
+        access_pin = self.register_pin.get()
+        if access_pin != self.register_pin_confirm.get() or not re.fullmatch(r"[0-9]{6,12}", access_pin):
+            self.enrollment_hint.configure(text="PIN de acceso: 6 a 12 dígitos iguales.", text_color=RED)
+            return
         if not re.fullmatch(r"[\w .-]{2,40}", name, flags=re.UNICODE):
             self.enrollment_hint.configure(text="Usa 2 a 40 letras, números, espacios, puntos o guiones.", text_color=RED)
             return
@@ -1035,11 +1136,17 @@ class SafeApp(ctk.CTk):
         self.enrollment_hint.configure(text="Preparando captura…", text_color=MUTED)
         self.capture_button.configure(state="disabled", text="Preparando…")
         self.register_entry.configure(state="disabled")
-        self.backend.send("start_enroll", name)
+        self.register_pin.configure(state="disabled")
+        self.register_pin_confirm.configure(state="disabled")
+        self.backend.send("start_enroll", (name, access_pin))
 
     def cancel_enrollment(self) -> None:
         self.backend.send("cancel_enroll")
         if self.register_window is not None and self.register_window.winfo_exists():
+            self.register_pin.configure(state="normal")
+            self.register_pin_confirm.configure(state="normal")
+            self.register_pin.delete(0, "end")
+            self.register_pin_confirm.delete(0, "end")
             self.register_window.grab_release()
             self.register_window.destroy()
         self.register_window = None
@@ -1047,6 +1154,10 @@ class SafeApp(ctk.CTk):
     def close_registration_after_success(self) -> None:
         self.modal_close_job = None
         if self.register_window is not None and self.register_window.winfo_exists():
+            self.register_pin.configure(state="normal")
+            self.register_pin_confirm.configure(state="normal")
+            self.register_pin.delete(0, "end")
+            self.register_pin_confirm.delete(0, "end")
             self.register_window.grab_release()
             self.register_window.destroy()
         self.register_window = None
@@ -1179,6 +1290,24 @@ class SafeApp(ctk.CTk):
             elif kind == "users":
                 self.people = event[1]
                 self.refresh_users()
+            elif kind == "pins":
+                self.access_pin_ids = set(event[1])
+                self.refresh_users()
+            elif kind == "pin_set":
+                self.notify(f"PIN de acceso guardado para {event[1]}")
+            elif kind == "pin_required":
+                self.show_access_pin(event[1], event[2])
+            elif kind == "pin_failed":
+                if self.access_window is not None and self.access_window.winfo_exists():
+                    self.access_entry.delete(0, "end")
+                    self.access_error.configure(text=event[1], text_color=RED)
+                    self.access_button.configure(state="normal")
+            elif kind == "pin_expired":
+                self.close_access_pin(False)
+                self.notify(event[1], error=True)
+            elif kind == "pin_success":
+                self.close_access_pin(False)
+                self.notify(f"Acceso autorizado: {event[1]}")
             elif kind == "user_deleted":
                 self.people = event[2]
                 self.known_users = [name for _, name, _ in self.people]
@@ -1199,15 +1328,19 @@ class SafeApp(ctk.CTk):
                 self.known_users = event[2]
                 self.update_user_count()
                 self.backend.send("list_users")
-                self.notify(f"{event[1]} registrado correctamente.")
+                self.notify(f"{event[1]} registrado correctamente." if event[3] else
+                            f"Rostro de {event[1]} guardado; falta asignar PIN de acceso.", error=not event[3])
                 if self.register_window is not None and self.register_window.winfo_exists():
-                    self.enrollment_hint.configure(text=f"{event[1]} registrado correctamente")
+                    self.enrollment_hint.configure(text=(f"{event[1]} registrado correctamente" if event[3] else
+                                                         "Rostro guardado; asigna PIN en Usuarios"))
                     self.modal_close_job = self.after(650, self.close_registration_after_success)
             elif kind == "enroll_error":
                 if self.register_window is not None and self.register_window.winfo_exists():
                     self.enrollment_hint.configure(text=event[1], text_color=RED)
                     self.capture_button.configure(state="normal", text="Reintentar")
                     self.register_entry.configure(state="normal")
+                    self.register_pin.configure(state="normal")
+                    self.register_pin_confirm.configure(state="normal")
             elif kind == "storage_error":
                 self.detail_label.configure(text=f"No se guardó el intento: {event[1]}")
                 self.notify(f"No se guardó el intento: {event[1]}", error=True)
@@ -1308,9 +1441,14 @@ class SafeApp(ctk.CTk):
             if job is not None:
                 self.after_cancel(job)
         if self.register_window is not None and self.register_window.winfo_exists():
+            self.register_pin.configure(state="normal")
+            self.register_pin_confirm.configure(state="normal")
+            self.register_pin.delete(0, "end")
+            self.register_pin_confirm.delete(0, "end")
             self.register_window.grab_release()
             self.register_window.destroy()
             self.register_window = None
+        self.close_access_pin(False)
         self.close_pin_window()
         self.withdraw()
         self.backend.stop()
@@ -1342,7 +1480,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=("simulacion", "hardware"))
     parser.add_argument("--port", help="puerto de la WeMos, por ejemplo COM3")
     parser.add_argument("--similarity-threshold", type=float,
-                        help="umbral coseno SFace entre 0 y 1 (predeterminado: 0.363)")
+                        help="umbral coseno SFace entre 0.5 y 0.9 (predeterminado: 0.5)")
     parser.add_argument("--camera-index", type=int, help="índice de cámara")
     parser.add_argument("--authorization-seconds", type=int, help="tiempo para confirmar cierre")
     args = parser.parse_args()

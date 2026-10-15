@@ -17,13 +17,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from control import LockController
+from control import AccessPinStore, LockController
 
 
 MODEL_DIR = Path(__file__).resolve().parent / "models"
 YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 SFACE_FILE = "face_recognition_sface_2021dec_int8.onnx"
-DEFAULT_SIMILARITY_THRESHOLD = 0.363
+DEFAULT_SIMILARITY_THRESHOLD = 0.5
 ENROLL_SAMPLES = 20
 
 
@@ -116,7 +116,7 @@ class FaceStore:
                 samples = np.load(path, allow_pickle=False)
                 self.templates[person_id] = self._medoid(samples)
 
-    def add_person(self, name: str, samples: list[np.ndarray]) -> None:
+    def add_person(self, name: str, samples: list[np.ndarray]) -> str:
         if len(samples) < ENROLL_SAMPLES:
             raise ValueError("Faltan muestras para registrar el rostro")
         existing_id = next((uid for uid, value in self.users.items()
@@ -141,13 +141,14 @@ class FaceStore:
                 temp.replace(self.index_path)
             self.users = updated
             self.templates[person_id] = template
+            return person_id
         except Exception:
             temporary.unlink(missing_ok=True)
             if existing_id is None and person_id not in self.users:
                 destination.unlink(missing_ok=True)
             raise
 
-    def identify(self, feature: np.ndarray, threshold: float) -> tuple[str | None, float | None]:
+    def identify_id(self, feature: np.ndarray, threshold: float) -> tuple[str | None, float | None]:
         if not self.templates:
             return None, None
         probe = np.asarray(feature, dtype=np.float32).reshape(-1)
@@ -155,12 +156,16 @@ class FaceStore:
         if probe.size != 128 or norm <= 0 or not np.isfinite(norm):
             raise ValueError("Rasgo facial inválido")
         probe /= norm
-        person_id, similarity = max(
-            ((uid, float(np.dot(probe, template))) for uid, template in self.templates.items()),
-            key=lambda item: item[1],
-        )
-        return (self.users[person_id] if similarity >= threshold else None,
-                similarity)
+        ranked = sorted(((uid, float(np.dot(probe, template)))
+                         for uid, template in self.templates.items()),
+                        key=lambda item: item[1], reverse=True)
+        person_id, similarity = ranked[0]
+        unambiguous = len(ranked) == 1 or similarity - ranked[1][1] >= 0.05
+        return (person_id if similarity >= threshold and unambiguous else None, similarity)
+
+    def identify(self, feature: np.ndarray, threshold: float) -> tuple[str | None, float | None]:
+        person_id, similarity = self.identify_id(feature, threshold)
+        return (self.users[person_id] if person_id is not None else None, similarity)
 
     def list_people(self) -> list[tuple[str, str, bool]]:
         return sorted(((uid, name, uid in self.templates) for uid, name in self.users.items()),
@@ -320,8 +325,8 @@ class SafeBackend:
     def __init__(self, data_dir: Path, mode: str, port: str | None,
                  similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
                  camera_index: int = 0, authorization_seconds: int = 8):
-        if not 0.0 < similarity_threshold < 1.0:
-            raise ValueError("El umbral de similitud debe estar entre 0 y 1")
+        if not 0.5 <= similarity_threshold <= 0.9:
+            raise ValueError("El umbral de similitud debe estar entre 0.5 y 0.9")
         self.data_dir = data_dir
         self.mode = mode
         self.port = port
@@ -443,6 +448,14 @@ class SafeBackend:
         enrolling_name = None
         samples: list[np.ndarray] = []
         last_sample = 0.0
+        enrolling_pin = None
+        pin_store = None
+        pending_access = None
+        prompted_id = None
+        authorized_id = None
+        last_verified_id = None
+        last_verified_at = 0.0
+        last_verified_similarity = None
 
         def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
@@ -464,8 +477,24 @@ class SafeBackend:
             except (OSError, sqlite3.Error) as exc:
                 self.events.put(("storage_error", str(exc)))
 
+        def end_pending(reason: str) -> None:
+            nonlocal pending_access
+            if pending_access is None:
+                return
+            pending_access = None
+            if self.frame is not None:
+                record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
+            if controller.state == LockController.LOCKED and bridge is not None:
+                try:
+                    bridge.send("DENIED")
+                except (OSError, TimeoutError, ConnectionError) as exc:
+                    controller.fail(f"ESP32 sin respuesta: {exc}")
+                    publish_lock()
+            self.events.put(("pin_expired", reason))
+
         try:
             store = FaceStore(self.data_dir)
+            pin_store = AccessPinStore(self.data_dir)
             history = AccessHistory(self.data_dir)
             face_detector, face_recognizer = load_models()
             try:
@@ -478,9 +507,12 @@ class SafeBackend:
                 controller.fail(f"ESP32 sin conexión: {exc}")
                 self.events.put(("device_error", controller.reason))
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
+            self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
             publish_lock()
             while not self.stop_event.is_set():
+                if pending_access is not None and time.monotonic() > pending_access[1]:
+                    end_pending("Tiempo agotado; vuelve a mostrar el rostro")
                 if controller.tick():
                     controller.reason = "Tiempo cumplido; confirma el cierre antes de bloquear"
                     publish_lock()
@@ -490,20 +522,25 @@ class SafeBackend:
                     except queue.Empty:
                         break
                     if kind == "start_enroll":
-                        name = (value or "").strip()
+                        name, access_pin = value if isinstance(value, tuple) else (value, None)
+                        name = (name or "").strip()
                         if not self.camera_connected:
                             self.events.put(("enroll_error", "La cámara no está disponible"))
+                        elif access_pin is None or not (6 <= len(access_pin) <= 12 and access_pin.isascii() and access_pin.isdecimal()):
+                            self.events.put(("enroll_error", "PIN de acceso: 6 a 12 dígitos"))
                         elif any(uid in store.templates and existing.casefold() == name.casefold()
                                  for uid, existing in store.users.items()):
                             self.events.put(("enroll_error", "Ese nombre ya tiene un perfil SFace"))
                         else:
                             enrolling_name = name
+                            enrolling_pin = access_pin
                             samples = []
                             last_sample = 0.0
                             candidate_name, streak = None, 0
                             self.events.put(("enroll_started", name))
                     elif kind == "cancel_enroll":
                         enrolling_name = None
+                        enrolling_pin = None
                         samples = []
                         candidate_name, streak = None, 0
                         state("ESCANEANDO", "Esperando un rostro frente a la cámara")
@@ -512,11 +549,62 @@ class SafeBackend:
                     elif kind == "delete_user":
                         try:
                             deleted = store.delete_person(value or "")
+                            pin_store.remove(value or "")
                             self.events.put(("user_deleted", deleted, store.list_people()))
+                            self.events.put(("pins", pin_store.ids()))
                             candidate_name, streak, logged_key = None, 0, None
                             state("ESCANEANDO", "Modelo facial actualizado")
                         except (OSError, ValueError) as exc:
                             self.events.put(("user_error", str(exc)))
+                    elif kind == "set_access_pin":
+                        person_id, access_pin = value
+                        try:
+                            if person_id not in store.users:
+                                raise ValueError("El usuario ya no existe")
+                            pin_store.set_pin(person_id, access_pin)
+                            self.events.put(("pins", pin_store.ids()))
+                            self.events.put(("pin_set", store.users[person_id]))
+                        except (OSError, ValueError) as exc:
+                            self.events.put(("user_error", str(exc)))
+                    elif kind == "cancel_access":
+                        end_pending("Verificación cancelada")
+                    elif kind == "access_pin":
+                        person_id, access_pin = value
+                        fresh = (self.camera_connected and pending_access is not None and
+                                 pending_access[0] == person_id and
+                                 time.monotonic() <= pending_access[1] and
+                                 last_verified_id == person_id and
+                                 time.monotonic() - last_verified_at <= 2.0)
+                        if not fresh or controller.state != LockController.LOCKED or bridge is None:
+                            end_pending("Rostro o cerradura no disponible; intenta de nuevo")
+                            continue
+                        try:
+                            pin_store.verify(person_id, access_pin)
+                        except (PermissionError, OSError) as exc:
+                            self.events.put(("pin_failed", str(exc)))
+                            state("DENEGADO", "PIN de acceso incorrecto")
+                            if self.frame is not None:
+                                record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
+                            try:
+                                bridge.send("DENIED")
+                            except (OSError, TimeoutError, ConnectionError) as error:
+                                controller.fail(f"ESP32 sin respuesta: {error}")
+                                pending_access = None
+                                self.events.put(("pin_expired", controller.reason))
+                                publish_lock()
+                            continue
+                        pending_access = None
+                        if controller.authorize(bridge, publish_lock):
+                            authorized_id = person_id
+                            name = store.users[person_id]
+                            state("AUTORIZADO", "Rostro y PIN verificados", name, last_verified_similarity)
+                            if self.frame is not None:
+                                record_attempt(name, "AUTORIZADO", last_verified_similarity, self.frame)
+                            self.events.put(("pin_success", name))
+                        else:
+                            state("DENEGADO", "La cerradura no confirmó la apertura")
+                            self.events.put(("pin_expired", "La cerradura no confirmó la apertura"))
+                        publish_lock()
                     elif kind == "search_history":
                         try:
                             user, result, offset = value
@@ -533,6 +621,7 @@ class SafeBackend:
                             controller.fail("Sin comunicación con la ESP32")
                         else:
                             controller.confirm_closed(bridge)
+                        authorized_id = None
                         publish_lock()
                     elif kind == "connect_device":
                         new_mode, new_port = value
@@ -567,6 +656,10 @@ class SafeBackend:
                     break
                 if not self.camera_connected:
                     candidate_name, streak = None, 0
+                    authorized_id = None
+                    last_verified_id = None
+                    if pending_access is not None:
+                        end_pending("Cámara desconectada")
                     state("CÁMARA DESCONECTADA", "Revisa conexión y permisos de Windows")
                     self.stop_event.wait(0.06)
                     continue
@@ -585,7 +678,14 @@ class SafeBackend:
                 count = len(boxes)
                 if count == 0:
                     candidate_name, streak = None, 0
+                    authorized_id = None
+                    last_verified_id = None
                     if now - last_face_seen > 1.0:
+                        if pending_access is not None:
+                            end_pending("Rostro fuera de cámara")
+                        prompted_id = None
+                        authorized_id = None
+                        last_verified_id = None
                         if logged_key is not None and controller.state == LockController.LOCKED and bridge is not None:
                             try:
                                 bridge.send("IDLE")
@@ -601,6 +701,10 @@ class SafeBackend:
                 last_face_seen = now
                 if count > 1:
                     candidate_name, streak = None, 0
+                    authorized_id = None
+                    if pending_access is not None:
+                        end_pending("Hay varios rostros en cámara")
+                    last_verified_id = None
                     if enrolling_name:
                         state("REGISTRANDO", "Debe aparecer una sola persona", enrolling_name, boxes=boxes)
                     else:
@@ -632,31 +736,67 @@ class SafeBackend:
                         enrolling_name = None
                         state("VERIFICANDO", "Guardando perfil SFace…")
                         try:
-                            store.add_person(name, samples)
+                            person_id = store.add_person(name, samples)
                         except Exception as exc:
                             self.events.put(("enroll_error", str(exc)))
                         else:
-                            self.events.put(("enroll_done", name, list(store.users.values())))
+                            pin_ok = True
+                            try:
+                                pin_store.set_pin(person_id, enrolling_pin)
+                            except (OSError, ValueError) as exc:
+                                pin_ok = False
+                                self.events.put(("user_error", f"Rostro guardado, PIN no guardado: {exc}. Asigna el PIN en Usuarios."))
+                            self.events.put(("enroll_done", name, list(store.users.values()), pin_ok))
+                            self.events.put(("pins", pin_store.ids()))
                         samples = []
+                        enrolling_pin = None
                         candidate_name, streak = None, 0
                     continue
-                name, similarity = store.identify(feature, self.similarity_threshold)
-                identity = name or "Desconocido"
+                person_id, similarity = store.identify_id(feature, self.similarity_threshold)
+                identity = person_id or "Desconocido"
                 streak = streak + 1 if identity == candidate_name else 1
                 candidate_name = identity
-                if streak < 3:
-                    state("VERIFICANDO", f"Lectura {streak}/3", similarity=similarity, boxes=boxes)
-                elif name is not None:
-                    key = f"allow:{name}"
-                    detail = "Coincidencia confirmada" if self.admin_ready else "Configura el PIN para habilitar aperturas"
-                    state("AUTORIZADO", detail, name, similarity, boxes)
-                    if (logged_key != key and self.admin_ready and
-                            controller.state == LockController.LOCKED and bridge is not None):
-                        controller.authorize(bridge, publish_lock)
-                        publish_lock()
-                    if logged_key != key:
-                        record_attempt(name, "AUTORIZADO", similarity, frame)
-                        logged_key = key
+                if pending_access is not None and person_id != pending_access[0]:
+                    end_pending("La identidad cambió; vuelve a intentar")
+                    last_verified_id = None
+                if person_id != prompted_id:
+                    prompted_id = None
+                    authorized_id = None
+                if streak < 4:
+                    state("VERIFICANDO", f"Lectura {streak}/4", similarity=similarity, boxes=boxes)
+                elif person_id is not None:
+                    last_verified_id = person_id
+                    last_verified_at = now
+                    last_verified_similarity = similarity
+                    if authorized_id == person_id:
+                        state("AUTORIZADO", "Rostro y PIN verificados", store.users[person_id], similarity, boxes)
+                    elif not self.admin_ready or not pin_store.has_pin(person_id):
+                        detail = ("Configura el PIN de administrador" if not self.admin_ready else
+                                  "Esta identidad necesita un PIN de acceso")
+                        state("DENEGADO", detail, "Desconocido", similarity, boxes)
+                        key = f"no-pin:{person_id}"
+                        if logged_key != key:
+                            record_attempt("Desconocido", "DENEGADO", similarity, frame)
+                            if controller.state == LockController.LOCKED and bridge is not None:
+                                try:
+                                    bridge.send("DENIED")
+                                except (OSError, TimeoutError, ConnectionError) as exc:
+                                    controller.fail(f"ESP32 sin respuesta: {exc}")
+                                    publish_lock()
+                            logged_key = key
+                    elif controller.state != LockController.LOCKED or bridge is None:
+                        state("VERIFICANDO", "Cerradura no disponible para una nueva apertura",
+                              similarity=similarity, boxes=boxes)
+                    else:
+                        if prompted_id == person_id and pending_access is None:
+                            state("DENEGADO", "Retira el rostro y vuelve a intentar", boxes=boxes)
+                        else:
+                            state("PIN REQUERIDO", "Posible coincidencia; introduce el PIN de acceso",
+                                  store.users[person_id], similarity, boxes)
+                        if prompted_id != person_id:
+                            pending_access = (person_id, now + 15.0)
+                            prompted_id = person_id
+                            self.events.put(("pin_required", person_id, store.users[person_id]))
                 else:
                     detail = "Rostro no registrado" if similarity is not None else "No hay perfiles SFace activos"
                     state("DENEGADO", detail, "Desconocido", similarity, boxes)
