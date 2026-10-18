@@ -271,6 +271,7 @@ class CommandBridge:
         self.serial = None
         self.last_command = None
         self.sequence = 0
+        self.boot_id = None
         if mode == "hardware":
             if not port:
                 raise ValueError("El modo hardware requiere --port COMx")
@@ -285,7 +286,7 @@ class CommandBridge:
             try:
                 self.send("PING", timeout=4.0)
             except Exception:
-                self.serial.close()
+                self.close()
                 raise
 
     def send(self, command: str, timeout: float = 1.5) -> None:
@@ -293,18 +294,30 @@ class CommandBridge:
             raise ValueError("Comando no permitido")
         if self.mode == "hardware" and self.serial is None:
             raise ConnectionError("ESP32 sin conexión")
+        if self.mode == "hardware" and command != "PING" and self.boot_id is None:
+            raise ConnectionError("Falta PING inicial de la ESP32")
         if self.serial is not None:
             self.sequence += 1
             sequence = self.sequence
             try:
-                self.serial.write(f"{command} {sequence}\n".encode("ascii"))
+                line = (f"PING {sequence}\n" if command == "PING" else
+                        f"{command} {sequence} {self.boot_id}\n")
+                self.serial.write(line.encode("ascii"))
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     line = self.serial.readline().decode("ascii", errors="replace").strip()
-                    if line == f"ACK {sequence} {command}":
+                    parts = line.split()
+                    if (len(parts) == 4 and parts[:3] == ["ACK", str(sequence), command] and
+                            all(char in "0123456789ABCDEFabcdef" for char in parts[3])):
+                        if self.boot_id is None:
+                            self.boot_id = parts[3].upper()
+                        elif self.boot_id != parts[3].upper():
+                            raise ConnectionError("La ESP32 se reinició; confirma el cierre antes de abrir")
                         break
-                    if line == f"ERR {sequence} {command}":
-                        raise ConnectionError(f"ESP32 rechazó {command}")
+                    if parts and parts[0] in {"ACK", "ERR"}:
+                        if parts[:3] == ["ERR", str(sequence), command]:
+                            raise ConnectionError(f"ESP32 rechazó {command}")
+                        raise ConnectionError(f"Respuesta serial incorrecta para {command}: {line}")
                 else:
                     raise TimeoutError(f"Sin ACK para {command}")
             except (OSError, TimeoutError, ConnectionError):
@@ -322,6 +335,9 @@ class CommandBridge:
 class SafeBackend:
     """La cámara y el motor son dueños de sus recursos; Tk nunca sale del hilo principal."""
 
+    HEARTBEAT_INTERVAL = 5.0
+    PING_TIMEOUT = 0.75
+
     def __init__(self, data_dir: Path, mode: str, port: str | None,
                  similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
                  camera_index: int = 0, authorization_seconds: int = 8):
@@ -334,6 +350,7 @@ class SafeBackend:
         self.camera_index = camera_index
         self.authorization_seconds = authorization_seconds
         self.admin_ready = False
+        self.physical_unknown = mode == "hardware"
         self.events: queue.Queue[tuple] = queue.Queue()
         self.commands: queue.Queue[tuple] = queue.Queue()
         self.camera_commands: queue.Queue = queue.Queue()
@@ -456,6 +473,8 @@ class SafeBackend:
         last_verified_id = None
         last_verified_at = 0.0
         last_verified_similarity = None
+        next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
+        device_error_reported = False
 
         def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
@@ -466,7 +485,12 @@ class SafeBackend:
                 last_state = payload
 
         def publish_lock() -> None:
+            nonlocal device_error_reported
             self.events.put(("lock", controller.state, controller.reason))
+            if (self.mode == "hardware" and controller.state == LockController.ERROR and
+                    not device_error_reported):
+                self.events.put(("device_error", controller.reason))
+                device_error_reported = True
 
         def record_attempt(user: str, result: str, similarity: float | None,
                            frame: np.ndarray) -> None:
@@ -502,15 +526,22 @@ class SafeBackend:
                 if self.mode == "hardware":
                     controller.state = LockController.WAITING_CLOSE
                     controller.reason = "Conexión verificada; confirma el cierre antes de bloquear"
-                self.events.put(("device", self.mode, self.port))
+                self.events.put(("device", self.mode, self.port, self.physical_unknown))
             except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
                 controller.fail(f"ESP32 sin conexión: {exc}")
-                self.events.put(("device_error", controller.reason))
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
             publish_lock()
             while not self.stop_event.is_set():
+                if (self.mode == "hardware" and bridge is not None and
+                        bridge.serial is not None and time.monotonic() >= next_ping):
+                    try:
+                        bridge.send("PING", timeout=self.PING_TIMEOUT)
+                    except (OSError, TimeoutError, ConnectionError) as exc:
+                        controller.fail(f"Se perdió la conexión con la ESP32 ({exc})")
+                        publish_lock()
+                    next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
                 if pending_access is not None and time.monotonic() > pending_access[1]:
                     end_pending("Tiempo agotado; vuelve a mostrar el rostro")
                 if controller.tick():
@@ -626,7 +657,7 @@ class SafeBackend:
                     elif kind == "connect_device":
                         new_mode, new_port = value
                         if controller.state in {LockController.UNLOCKED, LockController.PENDING}:
-                            self.events.put(("device_error", "Confirma el cierre antes de cambiar de modo"))
+                            self.events.put(("configuration_error", "Confirma el cierre antes de cambiar de modo"))
                         else:
                             try:
                                 candidate = CommandBridge(new_mode, new_port)
@@ -634,14 +665,17 @@ class SafeBackend:
                                     bridge.close()
                                 bridge = candidate
                                 self.mode, self.port = new_mode, new_port
+                                self.physical_unknown = self.physical_unknown or new_mode == "hardware"
                                 controller.state = (LockController.LOCKED if new_mode == "simulacion"
                                                     else LockController.WAITING_CLOSE)
-                                controller.reason = ("Simulación activa" if new_mode == "simulacion" else
+                                controller.reason = ("Simulación activa; estado físico desconocido" if new_mode == "simulacion" else
                                                      "ESP32 conectada; confirma el cierre")
-                                self.events.put(("device", new_mode, new_port))
+                                next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
+                                device_error_reported = False
+                                self.events.put(("device", new_mode, new_port, self.physical_unknown))
                                 publish_lock()
                             except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
-                                self.events.put(("device_error", str(exc)))
+                                self.events.put(("configuration_error", str(exc)))
                     elif kind == "stats":
                         self.events.put(("stats", history.stats()))
                     elif kind == "export_history":

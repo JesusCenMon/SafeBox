@@ -1,8 +1,10 @@
 // SAFEBOX AI: WeMos D1 ESP32-WROOM, Arduino-ESP32 3.x.
-// Ajusta pines y pulsos al montaje antes de conectar el MG90S a la cerradura.
+// Los movimientos quedan deshabilitados hasta completar calibration.h.
 #include <Arduino.h>
+#include <esp_system.h>
 #include <stdio.h>
 #include <string.h>
+#include "calibration.h"
 
 #ifndef SAFEBOX_SERVO_PIN
 #define SAFEBOX_SERVO_PIN 18
@@ -13,15 +15,11 @@
 #ifndef SAFEBOX_LED_RED_PIN
 #define SAFEBOX_LED_RED_PIN 26
 #endif
-#ifndef SAFEBOX_LOCK_US
-#define SAFEBOX_LOCK_US 1100
-#endif
-#ifndef SAFEBOX_OPEN_US
-#define SAFEBOX_OPEN_US 1900
-#endif
-
-static_assert(SAFEBOX_LOCK_US >= 1000 && SAFEBOX_LOCK_US <= 2000, "LOCK_US fuera de límites");
-static_assert(SAFEBOX_OPEN_US >= 1000 && SAFEBOX_OPEN_US <= 2000, "OPEN_US fuera de límites");
+static_assert((SAFEBOX_LOCK_US == 0 && SAFEBOX_OPEN_US == 0) ||
+              (SAFEBOX_LOCK_US >= 1000 && SAFEBOX_LOCK_US <= 2000 &&
+               SAFEBOX_OPEN_US >= 1000 && SAFEBOX_OPEN_US <= 2000 &&
+               SAFEBOX_LOCK_US != SAFEBOX_OPEN_US),
+              "Configura ambos pulsos distintos entre 1000 y 2000 us, o deja ambos en 0");
 static_assert(SAFEBOX_SERVO_PIN != SAFEBOX_LED_BLUE_PIN &&
               SAFEBOX_SERVO_PIN != SAFEBOX_LED_RED_PIN &&
               SAFEBOX_LED_BLUE_PIN != SAFEBOX_LED_RED_PIN, "Pines repetidos");
@@ -31,6 +29,8 @@ constexpr uint32_t PWM_MAX = 65535;           // 16 bits
 char lineBuffer[48];
 size_t lineLength = 0;
 bool servoReady = false;
+constexpr bool calibrated = SAFEBOX_LOCK_US != 0 && SAFEBOX_OPEN_US != 0;
+uint32_t bootId = 0;
 
 uint32_t dutyForPulse(uint32_t pulseUs) {
   return (pulseUs * PWM_MAX) / SERVO_PERIOD_US;
@@ -46,27 +46,44 @@ void reply(const char* type, unsigned long sequence, const char* command) {
   Serial.print(' ');
   Serial.print(sequence);
   Serial.print(' ');
-  Serial.println(command);
+  Serial.print(command);
+  Serial.print(' ');
+  Serial.println(bootId, HEX);
 }
 
 void handleLine(const char* line) {
   char command[12] = {};
   char extra = 0;
   unsigned long sequence = 0;
-  if (sscanf(line, "%11s %lu %c", command, &sequence, &extra) != 2) {
+  unsigned long session = 0;
+  const int fields = sscanf(line, "%11s %lu %lx %c", command, &sequence, &session, &extra);
+  if (fields < 2) {
     return;
   }
   if (strcmp(command, "PING") == 0) {
+    if (fields != 2) {
+      reply("ERR", sequence, command);
+      return;
+    }
     reply("ACK", sequence, command);
-  } else if (strcmp(command, "OPEN") == 0) {
-    if (!servoReady || !ledcWrite(SAFEBOX_SERVO_PIN, dutyForPulse(SAFEBOX_OPEN_US))) {
+    return;
+  }
+  // Sin el ID de este arranque, nunca mover el servo después de un reinicio.
+  if (fields != 3 || session != bootId) {
+    reply("ERR", sequence, command);
+    return;
+  }
+  if (strcmp(command, "OPEN") == 0) {
+    if (!calibrated || !servoReady ||
+        !ledcWrite(SAFEBOX_SERVO_PIN, dutyForPulse(SAFEBOX_OPEN_US))) {
       reply("ERR", sequence, command);
       return;
     }
     leds(true, false);
     reply("ACK", sequence, command);
   } else if (strcmp(command, "LOCK") == 0) {
-    if (!servoReady || !ledcWrite(SAFEBOX_SERVO_PIN, dutyForPulse(SAFEBOX_LOCK_US))) {
+    if (!calibrated || !servoReady ||
+        !ledcWrite(SAFEBOX_SERVO_PIN, dutyForPulse(SAFEBOX_LOCK_US))) {
       reply("ERR", sequence, command);
       return;
     }
@@ -85,6 +102,7 @@ void handleLine(const char* line) {
 
 void setup() {
   Serial.begin(115200);
+  bootId = esp_random();
   pinMode(SAFEBOX_LED_BLUE_PIN, OUTPUT);
   pinMode(SAFEBOX_LED_RED_PIN, OUTPUT);
   leds(false, false);

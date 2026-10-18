@@ -101,6 +101,56 @@ class AccessTests(unittest.TestCase):
                 backend.send("access_pin", (person_id, "456789"))
                 until("pin_success")
                 self.assertEqual(sent.count("OPEN"), 1)
+                backend.send("confirm_closed")
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and "LOCK" not in sent:
+                    time.sleep(0.02)
+                self.assertEqual(sent.count("LOCK"), 1)
+                self.assertEqual(sent.count("OPEN"), 1)
+                backend.stop()
+                backend.engine_thread.join(2)
+
+    def test_unknown_face_never_opens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            known = np.eye(1, 128, 0, dtype=np.float32).reshape(-1)
+            unknown = np.eye(1, 128, 1, dtype=np.float32).reshape(-1)
+            uid = core.FaceStore(root).add_person("Ana", [known] * core.ENROLL_SAMPLES)
+            AccessPinStore(root).set_pin(uid, "456789")
+            sent = []
+
+            class Bridge:
+                def __init__(self, *_args):
+                    pass
+
+                def send(self, command):
+                    sent.append(command)
+
+                def close(self):
+                    pass
+
+            backend = core.SafeBackend(root, "simulacion", None, 0.5)
+            backend.camera_connected = True
+            with (patch.object(core, "load_models", return_value=(object(), object())),
+                  patch.object(core, "detect_faces", return_value=np.zeros((1, 15), np.float32)),
+                  patch.object(core, "extract_feature", return_value=unknown),
+                  patch.object(core, "CommandBridge", Bridge)):
+                backend.engine_thread.start()
+                backend.send("admin_ready", True)
+                deadline = time.monotonic() + 3
+                denied = False
+                while time.monotonic() < deadline and not denied:
+                    backend.frame = np.zeros((32, 32, 3), np.uint8)
+                    backend.frame_seq += 1
+                    try:
+                        event = backend.events.get(timeout=0.08)
+                    except queue.Empty:
+                        continue
+                    if event[0] == "engine_error":
+                        self.fail(event[1])
+                    denied = event[0] == "state" and event[1] == "DENEGADO"
+                self.assertTrue(denied)
+                self.assertNotIn("OPEN", sent)
                 backend.stop()
                 backend.engine_thread.join(2)
                 self.assertFalse(backend.engine_thread.is_alive())

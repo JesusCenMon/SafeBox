@@ -78,6 +78,7 @@ class SafeApp(ctk.CTk):
         self.camera_index = camera_index
         self.authorization_seconds = authorization_seconds
         self.lock_state = "BLOQUEADA" if mode == "simulacion" else "ERROR"
+        self.physical_unknown = mode == "hardware"
         self.mode = mode
         self.running = True
         self.camera_connected = False
@@ -289,7 +290,7 @@ class SafeApp(ctk.CTk):
         led_card = self.card(hardware_row, 13)
         led_card.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL",
-                                            "BLOQUEADA" if self.mode == "simulacion" else "SIN CONFIRMAR")
+                                            "BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR")
         self.led_value = self.device_label(led_card, "LED VIRTUAL", "APAGADO")
         self.close_button = ctk.CTkButton(
             lock_card, text="Confirmar cierre", height=29, corner_radius=16,
@@ -1031,7 +1032,11 @@ class SafeApp(ctk.CTk):
 
     def update_lock(self, state: str, reason: str) -> None:
         self.lock_state = state
-        label = "BLOQUEO ORDENADO" if state == "BLOQUEADA" and self.mode == "hardware" else state
+        if self.mode == "simulacion":
+            label = (f"SIM {state}\nFÍSICO DESCONOCIDO" if self.physical_unknown else
+                     f"{state} · SOLO SIM")
+        else:
+            label = "BLOQUEO ORDENADO" if state == "BLOQUEADA" else state
         self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
                                   CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
         if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
@@ -1268,16 +1273,26 @@ class SafeApp(ctk.CTk):
                 self.update_lock(event[1], event[2])
             elif kind == "device":
                 mode, port = event[1], event[2]
-                self.mode_badge.configure(text="●  HARDWARE CONECTADO" if mode == "hardware" else "●  SIMULACIÓN",
-                                          text_color=CYAN)
-                self.settings_device.configure(text=f"Hardware · {port}" if mode == "hardware" else "Simulación · sin hardware conectado")
+                self.mode = mode
+                self.physical_unknown = event[3]
+                badge = ("●  HARDWARE CONECTADO" if mode == "hardware" else
+                         "●  SIM · FÍSICO DESCONOCIDO" if self.physical_unknown else "●  SOLO SIMULACIÓN")
+                self.mode_badge.configure(text=badge,
+                                          text_color=AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
+                self.settings_device.configure(text=f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
+                                               "Simulación · estado físico desconocido" if self.physical_unknown else
+                                               "Simulación · sin hardware conectado", text_color=TEXT)
                 if self.pending_settings is not None:
                     values, self.pending_settings = self.pending_settings, None
                     self.commit_settings(values)
             elif kind == "device_error":
                 self.pending_settings = None
+                self.physical_unknown = True
                 self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
                 self.settings_device.configure(text=event[1], text_color=RED)
+                self.notify(event[1], error=True)
+            elif kind == "configuration_error":
+                self.pending_settings = None
                 self.notify(event[1], error=True)
             elif kind == "export_done":
                 self.notify(f"{event[1]} intentos exportados a CSV")

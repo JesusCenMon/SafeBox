@@ -229,5 +229,5 @@ class LockController:
 
     def fail(self, reason: str) -> None:
         self.state = self.ERROR
-        self.reason = reason
+        self.reason = f"Estado físico desconocido: {reason}"
         self.deadline = 0.0
