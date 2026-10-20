@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -73,6 +74,54 @@ def extract_feature(recognizer, frame: np.ndarray, face: np.ndarray) -> np.ndarr
     if not np.isfinite(norm) or norm <= 0:
         raise ValueError("No se pudo extraer un rasgo facial válido")
     return feature / norm
+
+
+@dataclass(frozen=True)
+class FaceObservation:
+    box: tuple[int, int, int, int]
+    person_id: str | None
+    similarity: float | None
+    feature: np.ndarray | None
+    track_id: int = 0
+    streak: int = 1
+
+
+def _overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    shared = max(0, x2 - x1) * max(0, y2 - y1)
+    union = a[2] * a[3] + b[2] * b[3] - shared
+    return shared / union if union > 0 else 0.0
+
+
+class FaceTracker:
+    """Conserva una pista solo si posición, rasgos e identidad son inequívocos."""
+
+    def __init__(self):
+        self.previous: list[FaceObservation] = []
+        self.next_id = 1
+
+    def update(self, observations: list[FaceObservation]) -> list[FaceObservation]:
+        matches: dict[int, list[int]] = {}
+        for index, current in enumerate(observations):
+            matches[index] = [old_index for old_index, old in enumerate(self.previous)
+                              if current.person_id == old.person_id
+                              and _overlap(current.box, old.box) >= 0.2
+                              and current.feature is not None and old.feature is not None
+                              and float(np.dot(current.feature, old.feature)) >= 0.5]
+        updated = []
+        for index, current in enumerate(observations):
+            candidates = matches[index]
+            old = self.previous[candidates[0]] if (len(candidates) == 1 and
+                  sum(candidates[0] in found for found in matches.values()) == 1) else None
+            track_id = old.track_id if old else self.next_id
+            if old is None:
+                self.next_id += 1
+            updated.append(FaceObservation(current.box, current.person_id,
+                                           current.similarity, current.feature, track_id,
+                                           old.streak + 1 if old else 1))
+        self.previous = updated
+        return updated
 
 
 class FaceStore:
@@ -470,18 +519,27 @@ class SafeBackend:
         pending_access = None
         prompted_id = None
         authorized_id = None
+        authorized_track = None
         last_verified_id = None
         last_verified_at = 0.0
         last_verified_similarity = None
+        last_verified_track = None
+        tracker = FaceTracker()
+        face_labels: list[tuple[str, str]] = []
         next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
         device_error_reported = False
 
         def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
             nonlocal last_state
-            payload = (name, detail, user, similarity, tuple(boxes or ()))
+            visible_boxes = (boxes if boxes is not None else
+                             [item.box for item in tracker.previous]
+                             if name in {"AUTORIZADO", "DENEGADO", "PIN REQUERIDO"} else [])
+            labels = face_labels if visible_boxes else []
+            payload = (name, detail, user, similarity, tuple(visible_boxes), tuple(labels))
             if payload != last_state:
-                self.events.put(("state", name, detail, user, similarity, list(boxes or ())))
+                self.events.put(("state", name, detail, user, similarity,
+                                 list(visible_boxes), list(labels)))
                 last_state = payload
 
         def publish_lock() -> None:
@@ -563,6 +621,10 @@ class SafeBackend:
                                  for uid, existing in store.users.items()):
                             self.events.put(("enroll_error", "Ese nombre ya tiene un perfil SFace"))
                         else:
+                            if pending_access is not None:
+                                end_pending("Registro iniciado")
+                            tracker.update([])
+                            face_labels = []
                             enrolling_name = name
                             enrolling_pin = access_pin
                             samples = []
@@ -573,6 +635,8 @@ class SafeBackend:
                         enrolling_name = None
                         enrolling_pin = None
                         samples = []
+                        tracker.update([])
+                        face_labels = []
                         candidate_name, streak = None, 0
                         state("ESCANEANDO", "Esperando un rostro frente a la cámara")
                     elif kind == "list_users":
@@ -600,12 +664,22 @@ class SafeBackend:
                     elif kind == "cancel_access":
                         end_pending("Verificación cancelada")
                     elif kind == "access_pin":
-                        person_id, access_pin = value
-                        fresh = (self.camera_connected and pending_access is not None and
+                        if not isinstance(value, tuple) or len(value) != 3:
+                            self.events.put(("pin_failed", "Solicitud de PIN caducada"))
+                            continue
+                        person_id, access_pin, request_track = value
+                        fresh = (self.camera_connected and enrolling_name is None and
+                                 pending_access is not None and
                                  pending_access[0] == person_id and
+                                 pending_access[2] == request_track and
                                  time.monotonic() <= pending_access[1] and
                                  last_verified_id == person_id and
-                                 time.monotonic() - last_verified_at <= 2.0)
+                                 last_verified_track == pending_access[2] and
+                                 time.monotonic() - last_verified_at <= 2.0 and
+                                 self.frame_seq - last_seq <= 20 and
+                                 len([face for face in tracker.previous if face.person_id]) == 1 and
+                                 any(face.track_id == pending_access[2] and face.streak >= 4
+                                     for face in tracker.previous))
                         if not fresh or controller.state != LockController.LOCKED or bridge is None:
                             end_pending("Rostro o cerradura no disponible; intenta de nuevo")
                             continue
@@ -627,11 +701,15 @@ class SafeBackend:
                         pending_access = None
                         if controller.authorize(bridge, publish_lock):
                             authorized_id = person_id
+                            authorized_track = last_verified_track
                             name = store.users[person_id]
+                            face_labels = [(name, "AUTORIZADO") if item.track_id == authorized_track
+                                           else label for item, label in zip(tracker.previous, face_labels)]
                             state("AUTORIZADO", "Rostro y PIN verificados", name, last_verified_similarity)
                             if self.frame is not None:
                                 record_attempt(name, "AUTORIZADO", last_verified_similarity, self.frame)
                             self.events.put(("pin_success", name))
+                            self.events.put(("welcome",))
                         else:
                             state("DENEGADO", "La cerradura no confirmó la apertura")
                             self.events.put(("pin_expired", "La cerradura no confirmó la apertura"))
@@ -689,6 +767,8 @@ class SafeBackend:
                 if self.stop_event.is_set():
                     break
                 if not self.camera_connected:
+                    tracker.update([])
+                    face_labels = []
                     candidate_name, streak = None, 0
                     authorized_id = None
                     last_verified_id = None
@@ -711,8 +791,11 @@ class SafeBackend:
                 boxes = [tuple(round(float(v)) for v in face[:4]) for face in found]
                 count = len(boxes)
                 if count == 0:
+                    tracker.update([])
+                    face_labels = []
                     candidate_name, streak = None, 0
                     authorized_id = None
+                    authorized_track = None
                     last_verified_id = None
                     if now - last_face_seen > 1.0:
                         if pending_access is not None:
@@ -733,33 +816,19 @@ class SafeBackend:
                         state("ESCANEANDO", "Esperando un rostro frente a la cámara")
                     continue
                 last_face_seen = now
-                if count > 1:
-                    candidate_name, streak = None, 0
-                    authorized_id = None
-                    if pending_access is not None:
-                        end_pending("Hay varios rostros en cámara")
-                    last_verified_id = None
-                    if enrolling_name:
-                        state("REGISTRANDO", "Debe aparecer una sola persona", enrolling_name, boxes=boxes)
-                    else:
-                        state("DENEGADO", "Hay varios rostros en cámara", "Varios rostros", boxes=boxes)
-                        if logged_key != "multiple":
-                            record_attempt("Varios rostros", "DENEGADO", None, frame)
-                            if controller.state == LockController.LOCKED and bridge is not None:
-                                try:
-                                    bridge.send("DENIED")
-                                except (OSError, TimeoutError, ConnectionError) as exc:
-                                    controller.fail(f"ESP32 sin respuesta: {exc}")
-                                    publish_lock()
-                            logged_key = "multiple"
-                    continue
-                try:
-                    feature = extract_feature(face_recognizer, frame, found[0])
-                except (cv2.error, ValueError):
-                    candidate_name, streak = None, 0
-                    state("VERIFICANDO", "Ajusta el rostro frente a la cámara", boxes=boxes)
+                if enrolling_name and count > 1:
+                    tracker.update([])
+                    face_labels = []
+                    state("REGISTRANDO", "Debe aparecer una sola persona", enrolling_name, boxes=boxes)
                     continue
                 if enrolling_name:
+                    try:
+                        feature = extract_feature(face_recognizer, frame, found[0])
+                    except (cv2.error, ValueError):
+                        state("REGISTRANDO", "Ajusta el rostro frente a la cámara", boxes=boxes)
+                        continue
+                    tracker.update([])
+                    face_labels = []
                     if now - last_sample >= 0.25:
                         samples.append(feature)
                         last_sample = now
@@ -786,23 +855,60 @@ class SafeBackend:
                         enrolling_pin = None
                         candidate_name, streak = None, 0
                     continue
-                person_id, similarity = store.identify_id(feature, self.similarity_threshold)
-                identity = person_id or "Desconocido"
-                streak = streak + 1 if identity == candidate_name else 1
-                candidate_name = identity
-                if pending_access is not None and person_id != pending_access[0]:
-                    end_pending("La identidad cambió; vuelve a intentar")
+                observations = []
+                for face, box in zip(found, boxes):
+                    try:
+                        current_feature = extract_feature(face_recognizer, frame, face)
+                        current_id, current_similarity = store.identify_id(current_feature, self.similarity_threshold)
+                    except (cv2.error, ValueError):
+                        current_feature, current_id, current_similarity = None, None, None
+                    observations.append(FaceObservation(box, current_id, current_similarity,
+                                                        current_feature))
+                tracked = tracker.update(observations)
+                face_labels = [(store.users[item.person_id],
+                                "AUTORIZADO" if authorized_id == item.person_id and
+                                authorized_track == item.track_id else
+                                "PIN PENDIENTE" if pending_access is not None and
+                                pending_access[0] == item.person_id and
+                                pending_access[2] == item.track_id else "IDENTIDAD")
+                               if item.person_id and item.streak >= 4 else
+                               ("Desconocido", "DESCONOCIDO") for item in tracked]
+                # Conserva la correspondencia con los recuadros incluso si falla un rasgo.
+                boxes = [item.box for item in tracked]
+                known = [item for item in tracked if item.person_id is not None]
+                if pending_access is not None and (len(known) != 1 or
+                        known[0].track_id != pending_access[2] or
+                        known[0].person_id != pending_access[0] or known[0].streak < 4):
+                    end_pending("Se perdió el seguimiento del rostro; vuelve a intentar")
                     last_verified_id = None
-                if person_id != prompted_id:
+                    last_verified_track = None
+                if len(known) > 1:
+                    candidate_name, streak = None, 0
+                    last_verified_id = None
+                    last_verified_track = None
+                    state("VERIFICANDO", "Varios usuarios registrados; deja solo uno para acceder",
+                          boxes=boxes)
+                    continue
+                if not tracked:
+                    state("VERIFICANDO", "Ajusta el rostro frente a la cámara", boxes=boxes)
+                    continue
+                selected = known[0] if known else tracked[0]
+                person_id, similarity = selected.person_id, selected.similarity
+                identity = person_id or "Desconocido"
+                streak = selected.streak
+                candidate_name = identity
+                if prompted_id is not None and prompted_id != (person_id, selected.track_id):
                     prompted_id = None
                     authorized_id = None
+                    authorized_track = None
                 if streak < 4:
                     state("VERIFICANDO", f"Lectura {streak}/4", similarity=similarity, boxes=boxes)
                 elif person_id is not None:
                     last_verified_id = person_id
+                    last_verified_track = selected.track_id
                     last_verified_at = now
                     last_verified_similarity = similarity
-                    if authorized_id == person_id:
+                    if authorized_id == person_id and authorized_track == selected.track_id:
                         state("AUTORIZADO", "Rostro y PIN verificados", store.users[person_id], similarity, boxes)
                     elif not self.admin_ready or not pin_store.has_pin(person_id):
                         detail = ("Configura el PIN de administrador" if not self.admin_ready else
@@ -822,15 +928,16 @@ class SafeBackend:
                         state("VERIFICANDO", "Cerradura no disponible para una nueva apertura",
                               similarity=similarity, boxes=boxes)
                     else:
-                        if prompted_id == person_id and pending_access is None:
+                        if prompted_id == (person_id, selected.track_id) and pending_access is None:
                             state("DENEGADO", "Retira el rostro y vuelve a intentar", boxes=boxes)
                         else:
                             state("PIN REQUERIDO", "Posible coincidencia; introduce el PIN de acceso",
                                   store.users[person_id], similarity, boxes)
-                        if prompted_id != person_id:
-                            pending_access = (person_id, now + 15.0)
-                            prompted_id = person_id
-                            self.events.put(("pin_required", person_id, store.users[person_id]))
+                        if prompted_id != (person_id, selected.track_id):
+                            pending_access = (person_id, now + 15.0, selected.track_id)
+                            prompted_id = (person_id, selected.track_id)
+                            self.events.put(("pin_required", person_id, store.users[person_id],
+                                             selected.track_id))
                 else:
                     detail = "Rostro no registrado" if similarity is not None else "No hay perfiles SFace activos"
                     state("DENEGADO", detail, "Desconocido", similarity, boxes)

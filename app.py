@@ -55,6 +55,16 @@ def mix_color(start: str, end: str, amount: float) -> str:
     return "#" + "".join(f"{round(x + (y - x) * amount):02X}" for x, y in zip(a, b))
 
 
+def play_welcome_sound() -> None:
+    """Melodía breve en Windows; cualquier fallo de audio es no crítico."""
+    try:
+        import winsound
+        for frequency in (784, 988, 1175):
+            winsound.Beep(frequency, 75)
+    except Exception:
+        pass
+
+
 class SafeApp(ctk.CTk):
     def __init__(self, data_dir: Path, mode: str, port: str | None,
                  similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
@@ -88,11 +98,13 @@ class SafeApp(ctk.CTk):
         self.access_pin_ids: set[str] = set()
         self.access_window = None
         self.access_request = None
+        self.access_track = None
         self.history_rows: list[tuple] = []
         self.history_results: list[tuple] = []
         self.history_offset = 0
         self.current_page = "Inicio"
         self.boxes: list[tuple[int, int, int, int]] = []
+        self.face_labels: list[tuple[str, str]] = []
         self.last_frame_seq = 0
         self.status_state = ""
         self.status_color = CYAN
@@ -219,6 +231,7 @@ class SafeApp(ctk.CTk):
                                              state="hidden") for _ in range(8)]
             for _ in range(4)
         ]
+        self.label_items: list[tuple[int, int]] = []
         self.image_layout = (0, 0, 1, 1, 1.0)
         self.render_tick = 0
 
@@ -740,7 +753,7 @@ class SafeApp(ctk.CTk):
                       command=save).grid(row=4, column=0, sticky="ew", padx=26, pady=8)
         first.focus_set()
 
-    def show_access_pin(self, person_id: str, name: str) -> None:
+    def show_access_pin(self, person_id: str, name: str, track_id: int) -> None:
         if (self.admin_window is not None and self.admin_window.winfo_exists()) or (
                 self.register_window is not None and self.register_window.winfo_exists()):
             self.backend.send("cancel_access")
@@ -749,6 +762,7 @@ class SafeApp(ctk.CTk):
         window = ctk.CTkToplevel(self, fg_color=BG)
         self.access_window = window
         self.access_request = person_id
+        self.access_track = track_id
         window.title("SAFEBOX AI · Segundo factor")
         window.geometry("420x245")
         window.resizable(False, False)
@@ -782,7 +796,7 @@ class SafeApp(ctk.CTk):
             self.access_error.configure(text="Introduce 6 a 12 dígitos", text_color=RED)
             return
         self.access_button.configure(state="disabled")
-        self.backend.send("access_pin", (self.access_request, pin))
+        self.backend.send("access_pin", (self.access_request, pin, self.access_track))
 
     def close_access_pin(self, cancel: bool = True) -> None:
         if cancel and self.access_request is not None:
@@ -793,6 +807,7 @@ class SafeApp(ctk.CTk):
             self.access_window.destroy()
         self.access_window = None
         self.access_request = None
+        self.access_track = None
 
     def lock_admin_session(self) -> None:
         self.admin_until = 0.0
@@ -1249,6 +1264,7 @@ class SafeApp(ctk.CTk):
                     self.camera_canvas.itemconfigure(self.image_item, image="")
                     self.photo = None
                     self.boxes = []
+                    self.face_labels = []
                     self.position_boxes()
                     self.faces_label.configure(text="ROSTROS DETECTADOS  00")
                     self.set_state("CÁMARA DESCONECTADA", event[2])
@@ -1256,8 +1272,10 @@ class SafeApp(ctk.CTk):
             elif kind == "state":
                 if self.camera_connected:
                     self.set_state(event[1], event[2], event[3], event[4])
-                    if event[5] != self.boxes:
+                    labels = event[6] if len(event) > 6 else []
+                    if event[5] != self.boxes or labels != self.face_labels:
                         self.boxes = event[5]
+                        self.face_labels = labels
                         self.faces_label.configure(text=f"ROSTROS DETECTADOS  {len(self.boxes):02d}")
                         self.position_boxes()
             elif kind == "history":
@@ -1311,7 +1329,7 @@ class SafeApp(ctk.CTk):
             elif kind == "pin_set":
                 self.notify(f"PIN de acceso guardado para {event[1]}")
             elif kind == "pin_required":
-                self.show_access_pin(event[1], event[2])
+                self.show_access_pin(event[1], event[2], event[3])
             elif kind == "pin_failed":
                 if self.access_window is not None and self.access_window.winfo_exists():
                     self.access_entry.delete(0, "end")
@@ -1323,6 +1341,9 @@ class SafeApp(ctk.CTk):
             elif kind == "pin_success":
                 self.close_access_pin(False)
                 self.notify(f"Acceso autorizado: {event[1]}")
+            elif kind == "welcome":
+                threading.Thread(target=play_welcome_sound, daemon=True,
+                                 name="safebox-welcome").start()
             elif kind == "user_deleted":
                 self.people = event[2]
                 self.known_users = [name for _, name, _ in self.people]
@@ -1370,6 +1391,7 @@ class SafeApp(ctk.CTk):
                 self.camera_canvas.itemconfigure(self.image_item, image="")
                 self.photo = None
                 self.boxes = []
+                self.face_labels = []
                 self.position_boxes()
                 self.draw_placeholder()
                 if self.mode == "hardware":
@@ -1426,6 +1448,13 @@ class SafeApp(ctk.CTk):
     def position_boxes(self) -> None:
         canvas = self.camera_canvas
         offset_x, offset_y, _, _, scale = self.image_layout
+
+        while len(self.label_items) < len(self.boxes):
+            background = canvas.create_rectangle(0, 0, 0, 0, fill=SURFACE_2,
+                                                 outline=BORDER, state="hidden")
+            text = canvas.create_text(0, 0, anchor="nw", fill=TEXT,
+                                      font=("Segoe UI", 10, "bold"), state="hidden")
+            self.label_items.append((background, text))
         for index, group in enumerate(self.corner_items):
             if index >= len(self.boxes) or not self.camera_connected:
                 for item in group:
@@ -1445,6 +1474,31 @@ class SafeApp(ctk.CTk):
             for item, coords in zip(group, points):
                 canvas.coords(item, *coords)
                 canvas.itemconfigure(item, state="normal")
+
+        occupied = []
+        canvas_width = max(1, canvas.winfo_width())
+        for index, (background, text) in enumerate(self.label_items):
+            if index >= len(self.boxes) or not self.camera_connected:
+                canvas.itemconfigure(background, state="hidden")
+                canvas.itemconfigure(text, state="hidden")
+                continue
+            x, y, _, _ = self.boxes[index]
+            name, phase = (self.face_labels[index] if index < len(self.face_labels) else
+                           ("Desconocido", "DESCONOCIDO"))
+            caption = f"{name} · {phase}" if phase != "DESCONOCIDO" else name
+            color = CYAN if phase == "AUTORIZADO" else AMBER if phase == "PIN PENDIENTE" else BLUE if phase == "IDENTIDAD" else MUTED
+            canvas.itemconfigure(text, text=caption, fill=color, state="normal")
+            label_width = min(max(8, canvas_width - 8), max(90, len(caption) * 7 + 14))
+            left = max(4, min(canvas_width - label_width - 4, offset_x + int(x * scale)))
+            top = max(26, offset_y + int(y * scale) - 25)
+            while any(left < right and left + label_width > other_left and
+                      top < bottom and top + 20 > other_top
+                      for other_left, other_top, right, bottom in occupied):
+                top += 23
+            occupied.append((left, top, left + label_width, top + 20))
+            canvas.coords(background, left, top, left + label_width, top + 20)
+            canvas.coords(text, left + 7, top + 2)
+            canvas.itemconfigure(background, state="normal")
 
     def close(self) -> None:
         if not self.running:

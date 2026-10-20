@@ -12,6 +12,8 @@ import numpy as np
 import core
 from control import AccessPinStore, SettingsStore
 
+FACE = np.array([[0, 0, 16, 16] + [0] * 11], dtype=np.float32)
+
 
 class AccessTests(unittest.TestCase):
     def test_access_pin_hash_lockout_and_existing_profile(self):
@@ -72,7 +74,7 @@ class AccessTests(unittest.TestCase):
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
-                  patch.object(core, "detect_faces", return_value=np.zeros((1, 15), np.float32)),
+                  patch.object(core, "detect_faces", return_value=FACE),
                   patch.object(core, "extract_feature", return_value=feature),
                   patch.object(core, "CommandBridge", Bridge)):
                 backend.engine_thread.start()
@@ -95,10 +97,10 @@ class AccessTests(unittest.TestCase):
                 request = until("pin_required")
                 self.assertEqual(request[1], person_id)
                 self.assertNotIn("OPEN", sent)
-                backend.send("access_pin", (person_id, "000000"))
+                backend.send("access_pin", (person_id, "000000", request[3]))
                 until("pin_failed")
                 self.assertNotIn("OPEN", sent)
-                backend.send("access_pin", (person_id, "456789"))
+                backend.send("access_pin", (person_id, "456789", request[3]))
                 until("pin_success")
                 self.assertEqual(sent.count("OPEN"), 1)
                 backend.send("confirm_closed")
@@ -132,7 +134,7 @@ class AccessTests(unittest.TestCase):
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
-                  patch.object(core, "detect_faces", return_value=np.zeros((1, 15), np.float32)),
+                  patch.object(core, "detect_faces", return_value=FACE),
                   patch.object(core, "extract_feature", return_value=unknown),
                   patch.object(core, "CommandBridge", Bridge)):
                 backend.engine_thread.start()
@@ -175,7 +177,7 @@ class AccessTests(unittest.TestCase):
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
-                  patch.object(core, "detect_faces", return_value=np.zeros((1, 15), np.float32)),
+                  patch.object(core, "detect_faces", return_value=FACE),
                   patch.object(core, "extract_feature", return_value=feature),
                   patch.object(core, "CommandBridge", Bridge)):
                 backend.engine_thread.start()

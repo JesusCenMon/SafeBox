@@ -147,7 +147,7 @@ class SerialTests(unittest.TestCase):
                 self.fail(f"No llegó {kind}")
 
             with (patch.object(core, "load_models", return_value=(object(), object())),
-                  patch.object(core, "detect_faces", return_value=np.zeros((1, 15), np.float32)),
+                  patch.object(core, "detect_faces", return_value=np.array([[0, 0, 16, 16] + [0] * 11], np.float32)),
                   patch.object(core, "extract_feature", return_value=feature),
                   patch.object(core, "CommandBridge", Bridge)):
                 backend.engine_thread.start()
@@ -177,10 +177,11 @@ class SerialTests(unittest.TestCase):
                 backend.send("confirm_closed")
                 self.assertEqual(until("lock")[1], "BLOQUEADA")
                 self.assertEqual([command for command in instances[3].commands if command != "PING"], ["LOCK"])
-                self.assertEqual(until("pin_required", feed=True)[1], person_id)
+                request = until("pin_required", feed=True)
+                self.assertEqual(request[1], person_id)
                 instances[3].fail_ping = True
                 until("device_error")
-                backend.send("access_pin", (person_id, "456789"))
+                backend.send("access_pin", (person_id, "456789", request[3]))
                 until("pin_expired")
                 self.assertNotIn("OPEN", instances[3].commands)
                 backend.stop()
