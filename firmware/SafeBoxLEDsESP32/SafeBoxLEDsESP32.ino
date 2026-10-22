@@ -8,6 +8,7 @@
 constexpr uint8_t LED_BLUE_PIN = 25;
 constexpr uint8_t LED_RED_PIN = 26;
 constexpr uint32_t LED_DURATION_MS = 3000;
+constexpr uint32_t LINK_TIMEOUT_MS = 15000;
 
 char lineBuffer[48];
 size_t lineLength = 0;
@@ -15,6 +16,7 @@ bool discardingLine = false;
 uint32_t bootId = 0;
 uint32_t offAt = 0;
 bool ledsOn = false;
+uint32_t lastContactAt = 0;
 
 void setLeds(bool blueOn, bool redOn) {
   digitalWrite(LED_BLUE_PIN, blueOn ? HIGH : LOW);
@@ -41,6 +43,7 @@ void handleLine(const char* line) {
   const int fields = sscanf(line, "%15s %lu %lx %c", command, &sequence, &session, &extra);
   if (fields < 2) return;
   if (strcmp(command, "PING") == 0) {
+    if (fields == 2) lastContactAt = millis();
     reply(fields == 2 ? "ACK" : "ERR", sequence, command);
     return;
   }
@@ -50,12 +53,18 @@ void handleLine(const char* line) {
     return;
   }
   if (strcmp(command, "AUTH_OK") == 0) {
+    lastContactAt = millis();
     setLeds(true, false);
     offAt = millis() + LED_DURATION_MS;
     reply("ACK", sequence, command);
   } else if (strcmp(command, "AUTH_FAIL") == 0) {
+    lastContactAt = millis();
     setLeds(false, true);
-    offAt = millis() + LED_DURATION_MS;
+    offAt = 0;
+    reply("ACK", sequence, command);
+  } else if (strcmp(command, "LED_OFF") == 0) {
+    lastContactAt = millis();
+    setLeds(false, false);
     reply("ACK", sequence, command);
   } else {
     setLeds(false, false);
@@ -69,10 +78,12 @@ void setup() {
   setLeds(false, false);
   Serial.begin(115200);
   bootId = esp_random();
+  lastContactAt = millis();
 }
 
 void loop() {
-  if (ledsOn && static_cast<int32_t>(millis() - offAt) >= 0) {
+  if ((offAt != 0 && static_cast<int32_t>(millis() - offAt) >= 0) ||
+      (ledsOn && millis() - lastContactAt >= LINK_TIMEOUT_MS)) {
     setLeds(false, false);
   }
   while (Serial.available() > 0) {

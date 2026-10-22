@@ -140,6 +140,7 @@ class AccessTests(unittest.TestCase):
                     pass
 
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
+            backend.led_notifier = Mock()
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
                   patch.object(core, "detect_faces", return_value=FACE),
@@ -161,6 +162,19 @@ class AccessTests(unittest.TestCase):
                     denied = event[0] == "state" and event[1] == "DENEGADO"
                 self.assertTrue(denied)
                 self.assertNotIn("OPEN", sent)
+                backend.camera_connected = False
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        event = backend.events.get(timeout=0.08)
+                    except queue.Empty:
+                        continue
+                    if event[0] == "state" and event[1] == "CÁMARA DESCONECTADA":
+                        break
+                else:
+                    self.fail("No se apagaron los LEDs al salir de DENEGADO")
+                commands = [call.args[0] for call in backend.led_notifier.notify.call_args_list]
+                self.assertEqual(commands, ["AUTH_FAIL", "LED_OFF"])
                 backend.stop()
                 backend.engine_thread.join(2)
                 self.assertFalse(backend.engine_thread.is_alive())

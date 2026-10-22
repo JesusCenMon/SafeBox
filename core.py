@@ -339,7 +339,7 @@ class CommandBridge:
                 raise
 
     def send(self, command: str, timeout: float = 1.5) -> None:
-        allowed = ({"PING", "AUTH_OK", "AUTH_FAIL"} if self.mode == "leds" else
+        allowed = ({"PING", "AUTH_OK", "AUTH_FAIL", "LED_OFF"} if self.mode == "leds" else
                    {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
         if command not in allowed:
             raise ValueError("Comando no permitido")
@@ -384,12 +384,16 @@ class CommandBridge:
 
 
 class LedNotifier:
-    """Puerto independiente: solo PING y avisos LED, sin comandos de servo."""
+    """Sincroniza el último estado LED sin bloquear el motor ni tocar el servo."""
 
     def __init__(self, port: str, events: queue.Queue):
         self.port = port
         self.events = events
-        self.commands: queue.Queue[tuple[str, float]] = queue.Queue(maxsize=8)
+        self.desired = "LED_OFF"
+        self.changed_at = 0.0
+        self.generation = 0
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True, name="safebox-leds")
 
@@ -397,37 +401,54 @@ class LedNotifier:
         self.thread.start()
 
     def notify(self, command: str) -> None:
-        if command not in {"AUTH_OK", "AUTH_FAIL"}:
+        if command not in {"AUTH_OK", "AUTH_FAIL", "LED_OFF"}:
             raise ValueError("Aviso LED inválido")
-        try:
-            self.commands.put_nowait((command, time.monotonic()))
-        except queue.Full:
-            self.events.put(("led_device", False, "Cola de avisos LED saturada"))
+        with self.lock:
+            if command == self.desired:
+                return
+            self.desired = command
+            self.changed_at = time.monotonic()
+            self.generation += 1
+        self.wake.set()
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.wake.set()
 
     def _run(self) -> None:
         bridge = None
         next_ping = 0.0
+        applied_generation = -1
+        auth_attempt_generation = -1
+        announced = False
         try:
             while not self.stop_event.is_set():
                 if bridge is None:
                     try:
                         bridge = CommandBridge("leds", self.port)
                         next_ping = time.monotonic() + 5.0
-                        self.events.put(("led_device", True, f"LED ESP32 conectado en {self.port}"))
                     except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
                         self.events.put(("led_device", False, f"LED ESP32 sin conexión: {exc}"))
                         self.stop_event.wait(5.0)
                         continue
                 try:
-                    command, requested_at = self.commands.get(timeout=0.1)
-                except queue.Empty:
-                    command, requested_at = None, 0.0
-                try:
-                    if command is not None and time.monotonic() - requested_at <= 1.0:
-                        bridge.send(command, timeout=0.75)
+                    with self.lock:
+                        command, requested_at, generation = (
+                            self.desired, self.changed_at, self.generation)
+                    if generation != applied_generation:
+                        # Un AUTH_OK ya enviado no debe reactivarse al reconectar.
+                        if (command == "AUTH_OK" and
+                                (generation == auth_attempt_generation or
+                                 time.monotonic() - requested_at > 1.0)):
+                            bridge.send("LED_OFF", timeout=0.75)
+                        else:
+                            if command == "AUTH_OK":
+                                auth_attempt_generation = generation
+                            bridge.send(command, timeout=0.75)
+                        applied_generation = generation
+                    if not announced:
+                        self.events.put(("led_device", True, f"LED ESP32 conectado en {self.port}"))
+                        announced = True
                     if time.monotonic() >= next_ping:
                         bridge.send("PING", timeout=0.75)
                         next_ping = time.monotonic() + 5.0
@@ -435,6 +456,11 @@ class LedNotifier:
                     self.events.put(("led_device", False, f"LED ESP32 sin ACK: {exc}"))
                     bridge.close()
                     bridge = None
+                    applied_generation = -1
+                    announced = False
+                    continue
+                self.wake.wait(0.1)
+                self.wake.clear()
         finally:
             if bridge is not None:
                 bridge.close()
@@ -573,6 +599,7 @@ class SafeBackend:
         bridge = None
         controller = LockController(self.authorization_seconds, ready=self.mode == "simulacion")
         last_state: tuple | None = None
+        last_led_command = "LED_OFF"
         last_seq = 0
         last_analyze = 0.0
         last_face_seen = 0.0
@@ -599,7 +626,13 @@ class SafeBackend:
 
         def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
-            nonlocal last_state
+            nonlocal last_state, last_led_command
+            led_command = ("AUTH_FAIL" if name == "DENEGADO" else
+                           "AUTH_OK" if name == "AUTORIZADO" else "LED_OFF")
+            if led_command != last_led_command:
+                if self.led_notifier is not None:
+                    self.led_notifier.notify(led_command)
+                last_led_command = led_command
             visible_boxes = (boxes if boxes is not None else
                              [item.box for item in tracker.previous]
                              if name in {"AUTORIZADO", "DENEGADO", "PIN REQUERIDO"} else [])
@@ -620,9 +653,6 @@ class SafeBackend:
 
         def record_attempt(user: str, result: str, similarity: float | None,
                            frame: np.ndarray) -> None:
-            if (result == "DENEGADO" and controller.state == LockController.LOCKED
-                    and self.led_notifier is not None):
-                self.led_notifier.notify("AUTH_FAIL")
             try:
                 history.record(user, result, similarity, frame)
                 self.events.put(("history", history.recent()))
@@ -771,8 +801,6 @@ class SafeBackend:
                             continue
                         pending_access = None
                         if controller.authorize(bridge, publish_lock):
-                            if self.led_notifier is not None:
-                                self.led_notifier.notify("AUTH_OK")
                             authorized_id = person_id
                             authorized_track = last_verified_track
                             name = store.users[person_id]

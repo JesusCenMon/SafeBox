@@ -110,8 +110,10 @@ class SerialTests(unittest.TestCase):
                 bridge.send("OPEN")
             bridge.send("AUTH_OK")
             bridge.send("AUTH_FAIL")
+            bridge.send("LED_OFF")
             self.assertEqual(device.writes[1:],
-                             [b"AUTH_OK 2 A1B2C3D4\n", b"AUTH_FAIL 3 A1B2C3D4\n"])
+                             [b"AUTH_OK 2 A1B2C3D4\n", b"AUTH_FAIL 3 A1B2C3D4\n",
+                              b"LED_OFF 4 A1B2C3D4\n"])
             device.wrong_ack = True
             with self.assertRaises(ConnectionError):
                 bridge.send("AUTH_OK")
@@ -125,15 +127,29 @@ class SerialTests(unittest.TestCase):
             notifier.start()
             try:
                 self.assertEqual(events.get(timeout=2)[0:2], ("led_device", True))
+                self.assertEqual(device.writes[:2], [b"PING 1\n", b"LED_OFF 2 A1B2C3D4\n"])
                 started = time.monotonic()
-                notifier.notify("AUTH_OK")
+                notifier.notify("AUTH_FAIL")
                 self.assertLess(time.monotonic() - started, 0.05)
                 deadline = time.monotonic() + 2
-                while len(device.writes) < 2 and time.monotonic() < deadline:
+                while len(device.writes) < 3 and time.monotonic() < deadline:
                     time.sleep(0.01)
-                self.assertEqual(device.writes[1], b"AUTH_OK 2 A1B2C3D4\n")
-                device.wrong_ack = True
+                self.assertEqual(device.writes[2], b"AUTH_FAIL 3 A1B2C3D4\n")
                 notifier.notify("AUTH_FAIL")
+                time.sleep(0.15)
+                self.assertEqual(len(device.writes), 3)
+                notifier.notify("LED_OFF")
+                deadline = time.monotonic() + 2
+                while len(device.writes) < 4 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(device.writes[3], b"LED_OFF 4 A1B2C3D4\n")
+                notifier.notify("AUTH_OK")
+                deadline = time.monotonic() + 2
+                while len(device.writes) < 5 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(device.writes[4], b"AUTH_OK 5 A1B2C3D4\n")
+                device.wrong_ack = True
+                notifier.notify("LED_OFF")
                 self.assertEqual(events.get(timeout=2)[0:2], ("led_device", False))
                 self.assertTrue(device.closed)
             finally:
