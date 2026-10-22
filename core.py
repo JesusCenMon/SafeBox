@@ -315,6 +315,10 @@ class AccessHistory:
 class CommandBridge:
     """Comandos con ACK; ninguna acción de servo implícita al conectar o cerrar."""
 
+    BOOT_WAIT_SECONDS = 2.0
+    INITIAL_PING_TIMEOUT = 4.0
+    INITIAL_PING_RETRIES = 2
+
     def __init__(self, mode: str, port: str | None = None, baudrate: int = 115200):
         self.mode = mode
         self.serial = None
@@ -333,12 +337,21 @@ class CommandBridge:
             self.serial = serial.Serial(port=port, baudrate=baudrate,
                                         timeout=0.1, write_timeout=0.5)
             try:
-                self.send("PING", timeout=4.0)
+                time.sleep(self.BOOT_WAIT_SECONDS)
+                for attempt in range(self.INITIAL_PING_RETRIES + 1):
+                    try:
+                        self.send("PING", timeout=self.INITIAL_PING_TIMEOUT,
+                                  close_on_error=False)
+                        break
+                    except (OSError, TimeoutError, ConnectionError):
+                        if attempt == self.INITIAL_PING_RETRIES:
+                            raise
             except Exception:
                 self.close()
                 raise
 
-    def send(self, command: str, timeout: float = 1.5) -> None:
+    def send(self, command: str, timeout: float = 1.5, *,
+             close_on_error: bool = True) -> None:
         allowed = ({"PING", "AUTH_OK", "AUTH_FAIL", "LED_OFF"} if self.mode == "leds" else
                    {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
         if command not in allowed:
@@ -372,7 +385,8 @@ class CommandBridge:
                 else:
                     raise TimeoutError(f"Sin ACK para {command}")
             except (OSError, TimeoutError, ConnectionError):
-                self.close()
+                if close_on_error:
+                    self.close()
                 raise
         if command != "PING":
             self.last_command = command

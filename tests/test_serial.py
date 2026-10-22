@@ -47,7 +47,35 @@ class FakeSerial:
         self.closed = True
 
 
+@patch.object(core.CommandBridge, "BOOT_WAIT_SECONDS", 0)
 class SerialTests(unittest.TestCase):
+    def test_initial_ping_waits_for_boot_and_recovers_from_two_timeouts(self):
+        class BootSerial(FakeSerial):
+            def write(self, data):
+                super().write(data)
+                if data.startswith(b"PING") and len(self.writes) < 3:
+                    self.reply = b""
+
+        device = BootSerial()
+        with (patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: device)}),
+              patch.object(core.CommandBridge, "BOOT_WAIT_SECONDS", 2.0),
+              patch.object(core.CommandBridge, "INITIAL_PING_TIMEOUT", 0.01),
+              patch.object(core.time, "sleep") as sleep):
+            bridge = core.CommandBridge("leds", "COM4")
+            sleep.assert_called_once_with(2.0)
+            self.assertEqual(device.writes, [b"PING 1\n", b"PING 2\n", b"PING 3\n"])
+            self.assertEqual(bridge.boot_id, device.boot_id)
+            self.assertFalse(device.closed)
+            bridge.close()
+
+            silent = FakeSerial()
+            silent.silent = True
+            with patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: silent)}):
+                with self.assertRaises(TimeoutError):
+                    core.CommandBridge("leds", "COM4")
+            self.assertEqual(silent.writes, [b"PING 1\n", b"PING 2\n", b"PING 3\n"])
+            self.assertTrue(silent.closed)
+
     def test_ack_errors_timeout_disconnect_and_reconnect_without_motion(self):
         serials = []
 
@@ -98,7 +126,7 @@ class SerialTests(unittest.TestCase):
             with patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: failed)}):
                 with self.assertRaises(ConnectionError):
                     core.CommandBridge("hardware", "COM6")
-            self.assertEqual(failed.writes, [b"PING 1\n"])
+            self.assertEqual(failed.writes, [b"PING 1\n", b"PING 2\n", b"PING 3\n"])
             self.assertTrue(failed.closed)
 
     def test_led_only_protocol_ack_and_no_servo_commands(self):
