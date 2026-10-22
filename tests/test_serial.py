@@ -49,6 +49,13 @@ class FakeSerial:
 
 @patch.object(core.CommandBridge, "BOOT_WAIT_SECONDS", 0)
 class SerialTests(unittest.TestCase):
+    def test_missing_pyserial_names_active_interpreter(self):
+        with patch.dict(sys.modules, {"serial": None}):
+            with self.assertRaises(RuntimeError) as failure:
+                core.CommandBridge("leds", "COM4")
+        self.assertIn(sys.executable, str(failure.exception))
+        self.assertIn("pyserial", str(failure.exception))
+
     def test_initial_ping_waits_for_boot_and_recovers_from_two_timeouts(self):
         class BootSerial(FakeSerial):
             def write(self, data):
@@ -178,7 +185,9 @@ class SerialTests(unittest.TestCase):
                 self.assertEqual(device.writes[4], b"AUTH_OK 5 A1B2C3D4\n")
                 device.wrong_ack = True
                 notifier.notify("LED_OFF")
-                self.assertEqual(events.get(timeout=2)[0:2], ("led_device", False))
+                failure = events.get(timeout=2)
+                self.assertEqual(failure[:2], ("led_device", False))
+                self.assertIn("Respuesta serial incorrecta", failure[2])
                 self.assertTrue(device.closed)
             finally:
                 notifier.stop()

@@ -332,7 +332,7 @@ class CommandBridge:
                 import serial  # pyserial solo es necesario al conectar hardware
             except ImportError as exc:
                 raise RuntimeError(
-                    "Instala pyserial para usar hardware: python -m pip install pyserial"
+                    f"Falta pyserial en {sys.executable}; instálalo con ese Python: -m pip install pyserial"
                 ) from exc
             self.serial = serial.Serial(port=port, baudrate=baudrate,
                                         timeout=0.1, write_timeout=0.5)

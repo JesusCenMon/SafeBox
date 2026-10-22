@@ -85,6 +85,7 @@ class SafeApp(ctk.CTk):
         self.led_port = led_port
         self.led_connected = False
         self.led_error_seen = False
+        self.led_error_message: str | None = None
         self.backend = SafeBackend(data_dir, mode, port, similarity_threshold,
                                    camera_index, authorization_seconds,
                                    led_port=led_port)
@@ -1311,8 +1312,9 @@ class SafeApp(ctk.CTk):
                 self.mode_badge.configure(text=badge,
                                           text_color=RED if self.led_port and self.led_error_seen else
                                           AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
-                self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} "
-                                                     f"{'conectados' if self.led_connected else 'sin conexión' if self.led_error_seen else 'conectando'}") if self.led_port else
+                self.settings_device.configure(text=(self.led_error_message if self.led_error_message else
+                                               f"Cerradura simulada · LEDs {self.led_port} "
+                                               f"{'conectados' if self.led_connected else 'conectando'}") if self.led_port else
                                                f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
                                                "Simulación · estado físico desconocido" if self.physical_unknown else
                                                "Simulación · sin hardware conectado",
@@ -1328,11 +1330,12 @@ class SafeApp(ctk.CTk):
                 self.notify(event[1], error=True)
             elif kind == "led_device":
                 self.led_connected = event[1]
+                self.led_error_message = None if event[1] else event[2]
                 self.mode_badge.configure(text=("●  LED ESP32 CONECTADO" if event[1] else
                                                 "●  LED ESP32 SIN CONEXIÓN"),
                                           text_color=CYAN if event[1] else RED)
-                self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} "
-                                                     f"{'conectados' if event[1] else 'sin conexión'}"),
+                self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} conectados"
+                                                     if event[1] else event[2]),
                                                text_color=TEXT if event[1] else RED)
                 if event[1]:
                     self.led_error_seen = False
