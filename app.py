@@ -1578,7 +1578,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=BASE / "datos")
     parser.add_argument("--mode", choices=("simulacion", "hardware"))
     parser.add_argument("--port", help="puerto de la WeMos, por ejemplo COM3")
-    parser.add_argument("--led-port", help="ESP32 con firmware LED GPIO 18/19, por ejemplo COM3; usa simulación")
+    parser.add_argument("--led-port", help="ESP32 LED GPIO 25/26 (predeterminado: COM4); usa COMx u OFF")
     parser.add_argument("--similarity-threshold", type=float,
                         help="umbral coseno SFace entre 0.5 y 0.9 (predeterminado: 0.5)")
     parser.add_argument("--camera-index", type=int, help="índice de cámara")
@@ -1594,6 +1594,7 @@ def main() -> None:
     try:
         settings = SettingsStore(args.data_dir)
         values = dict(settings.values)
+        values["mode"] = args.mode if args.mode is not None else "simulacion"
         for key, supplied in (("mode", args.mode), ("port", args.port),
                               ("similarity_threshold", args.similarity_threshold),
                               ("camera_index", args.camera_index),
@@ -1601,12 +1602,16 @@ def main() -> None:
             if supplied is not None:
                 values[key] = supplied
         settings.validate(values)
-        if args.led_port and values["mode"] != "simulacion":
+        led_port = (args.led_port.strip().upper() if args.led_port is not None else
+                    "COM4" if values["mode"] == "simulacion" else None)
+        if led_port == "OFF":
+            led_port = None
+        if led_port and values["mode"] != "simulacion":
             raise ValueError("--led-port requiere --mode simulacion para no enviar comandos al servo")
         app = SafeApp(args.data_dir, values["mode"], values["port"],
                       values["similarity_threshold"], values["camera_index"],
                       values["authorization_seconds"], settings,
-                      args.led_port.strip().upper() if args.led_port else None)
+                      led_port)
     except Exception as exc:
         raise SystemExit(f"No se pudo iniciar SAFEBOX AI: {exc}") from exc
     app.mainloop()
