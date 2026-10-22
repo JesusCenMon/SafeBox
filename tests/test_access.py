@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -72,6 +72,7 @@ class AccessTests(unittest.TestCase):
                     pass
 
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
+            backend.led_notifier = Mock()
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
                   patch.object(core, "detect_faces", return_value=FACE),
@@ -100,9 +101,12 @@ class AccessTests(unittest.TestCase):
                 backend.send("access_pin", (person_id, "000000", request[3]))
                 until("pin_failed")
                 self.assertNotIn("OPEN", sent)
+                self.assertNotIn("AUTH_OK", [call.args[0] for call in backend.led_notifier.notify.call_args_list])
+                self.assertIn("AUTH_FAIL", [call.args[0] for call in backend.led_notifier.notify.call_args_list])
                 backend.send("access_pin", (person_id, "456789", request[3]))
                 until("pin_success")
                 self.assertEqual(sent.count("OPEN"), 1)
+                self.assertEqual([call.args[0] for call in backend.led_notifier.notify.call_args_list].count("AUTH_OK"), 1)
                 backend.send("confirm_closed")
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline and "LOCK" not in sent:

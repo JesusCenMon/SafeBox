@@ -101,6 +101,46 @@ class SerialTests(unittest.TestCase):
             self.assertEqual(failed.writes, [b"PING 1\n"])
             self.assertTrue(failed.closed)
 
+    def test_led_only_protocol_ack_and_no_servo_commands(self):
+        device = FakeSerial()
+        with patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: device)}):
+            bridge = core.CommandBridge("leds", "COM3")
+            self.assertEqual(device.writes, [b"PING 1\n"])
+            with self.assertRaises(ValueError):
+                bridge.send("OPEN")
+            bridge.send("AUTH_OK")
+            bridge.send("AUTH_FAIL")
+            self.assertEqual(device.writes[1:],
+                             [b"AUTH_OK 2 A1B2C3D4\n", b"AUTH_FAIL 3 A1B2C3D4\n"])
+            device.wrong_ack = True
+            with self.assertRaises(ConnectionError):
+                bridge.send("AUTH_OK")
+            self.assertTrue(device.closed)
+
+    def test_led_notifier_runs_outside_engine_and_reports_bad_ack(self):
+        device = FakeSerial()
+        events = queue.Queue()
+        with patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: device)}):
+            notifier = core.LedNotifier("COM3", events)
+            notifier.start()
+            try:
+                self.assertEqual(events.get(timeout=2)[0:2], ("led_device", True))
+                started = time.monotonic()
+                notifier.notify("AUTH_OK")
+                self.assertLess(time.monotonic() - started, 0.05)
+                deadline = time.monotonic() + 2
+                while len(device.writes) < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(device.writes[1], b"AUTH_OK 2 A1B2C3D4\n")
+                device.wrong_ack = True
+                notifier.notify("AUTH_FAIL")
+                self.assertEqual(events.get(timeout=2)[0:2], ("led_device", False))
+                self.assertTrue(device.closed)
+            finally:
+                notifier.stop()
+                notifier.thread.join(2)
+                self.assertFalse(notifier.thread.is_alive())
+
     def test_heartbeat_loss_mode_switch_and_manual_lock(self):
         instances = []
 

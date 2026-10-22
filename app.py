@@ -69,7 +69,8 @@ class SafeApp(ctk.CTk):
     def __init__(self, data_dir: Path, mode: str, port: str | None,
                  similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
                  camera_index: int = 0, authorization_seconds: int = 8,
-                 settings: SettingsStore | None = None):
+                 settings: SettingsStore | None = None,
+                 led_port: str | None = None):
         super().__init__(fg_color=BG)
         self.title("SAFEBOX AI · Dashboard biométrico")
         self.geometry("1220x720+40+30")
@@ -81,8 +82,12 @@ class SafeApp(ctk.CTk):
         self.admin_until = 0.0
         self.admin_window = None
         self.pending_settings = None
+        self.led_port = led_port
+        self.led_connected = False
+        self.led_error_seen = False
         self.backend = SafeBackend(data_dir, mode, port, similarity_threshold,
-                                   camera_index, authorization_seconds)
+                                   camera_index, authorization_seconds,
+                                   led_port=led_port)
         self.backend.send("admin_ready", self.admin.configured)
         self.similarity_threshold = similarity_threshold
         self.camera_index = camera_index
@@ -182,7 +187,8 @@ class SafeApp(ctk.CTk):
                                         font=ctk.CTkFont("Consolas", 12))
         self.clock_label.pack(side="left", padx=(0, 18))
         self.clock_label.configure(text=datetime.now().strftime("%H:%M:%S"))
-        mode_label = "SIMULACIÓN" if self.mode == "simulacion" else "HARDWARE · INICIANDO"
+        mode_label = ("LED ESP32 · CONECTANDO" if self.led_port else
+                      "SIMULACIÓN" if self.mode == "simulacion" else "HARDWARE · INICIANDO")
         self.mode_badge = ctk.CTkLabel(
             header_right, text=f"●  {mode_label}",
             text_color=MUTED if self.mode == "simulacion" else AMBER,
@@ -445,7 +451,9 @@ class SafeApp(ctk.CTk):
         self.settings_camera = self.setting_line(settings_card, 1, "Cámara", "Iniciando…")
         self.settings_engine = self.setting_line(settings_card, 2, "Reconocimiento", "Iniciando…")
         self.setting_line(settings_card, 3, "Modelo facial", "YuNet + SFace · CPU")
-        mode_text = "Simulación · sin hardware conectado" if self.mode == "simulacion" else f"Hardware · esperando conexión ({self.backend.port})"
+        mode_text = (f"Cerradura simulada · LEDs {self.led_port} conectando" if self.led_port else
+                     "Simulación · sin hardware conectado" if self.mode == "simulacion" else
+                     f"Hardware · esperando conexión ({self.backend.port})")
         self.settings_device = self.setting_line(settings_card, 4, "Modo", mode_text)
         self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
         self.threshold_entry = self.setting_input(settings_card, 6, "Umbral SFace", f"{self.similarity_threshold:.3f}")
@@ -823,6 +831,8 @@ class SafeApp(ctk.CTk):
                 "port": self.port_entry.get().strip().upper(),
             }
             self.settings.validate(values)
+            if self.led_port and values["mode"] != "simulacion":
+                raise ValueError("Con LEDs en GPIO 18/19, conserva la cerradura en simulación")
         except (ValueError, TypeError) as exc:
             self.notify(f"Ajustes inválidos: {exc}", error=True)
             return
@@ -1293,11 +1303,15 @@ class SafeApp(ctk.CTk):
                 mode, port = event[1], event[2]
                 self.mode = mode
                 self.physical_unknown = event[3]
-                badge = ("●  HARDWARE CONECTADO" if mode == "hardware" else
+                badge = ("●  LED ESP32 CONECTADO" if self.led_port and self.led_connected else
+                         "●  LED ESP32 CONECTANDO" if self.led_port else
+                         "●  HARDWARE CONECTADO" if mode == "hardware" else
                          "●  SIM · FÍSICO DESCONOCIDO" if self.physical_unknown else "●  SOLO SIMULACIÓN")
                 self.mode_badge.configure(text=badge,
                                           text_color=AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
-                self.settings_device.configure(text=f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
+                self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} "
+                                                     f"{'conectados' if self.led_connected else 'conectando'}") if self.led_port else
+                                               f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
                                                "Simulación · estado físico desconocido" if self.physical_unknown else
                                                "Simulación · sin hardware conectado", text_color=TEXT)
                 if self.pending_settings is not None:
@@ -1309,6 +1323,19 @@ class SafeApp(ctk.CTk):
                 self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
                 self.settings_device.configure(text=event[1], text_color=RED)
                 self.notify(event[1], error=True)
+            elif kind == "led_device":
+                self.led_connected = event[1]
+                self.mode_badge.configure(text=("●  LED ESP32 CONECTADO" if event[1] else
+                                                "●  LED ESP32 SIN CONEXIÓN"),
+                                          text_color=CYAN if event[1] else RED)
+                self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} "
+                                                     f"{'conectados' if event[1] else 'sin conexión'}"),
+                                               text_color=TEXT if event[1] else RED)
+                if event[1]:
+                    self.led_error_seen = False
+                elif not self.led_error_seen:
+                    self.notify(event[2], error=True)
+                    self.led_error_seen = True
             elif kind == "configuration_error":
                 self.pending_settings = None
                 self.notify(event[1], error=True)
@@ -1548,6 +1575,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=BASE / "datos")
     parser.add_argument("--mode", choices=("simulacion", "hardware"))
     parser.add_argument("--port", help="puerto de la WeMos, por ejemplo COM3")
+    parser.add_argument("--led-port", help="ESP32 con firmware LED GPIO 18/19, por ejemplo COM3; usa simulación")
     parser.add_argument("--similarity-threshold", type=float,
                         help="umbral coseno SFace entre 0.5 y 0.9 (predeterminado: 0.5)")
     parser.add_argument("--camera-index", type=int, help="índice de cámara")
@@ -1570,9 +1598,12 @@ def main() -> None:
             if supplied is not None:
                 values[key] = supplied
         settings.validate(values)
+        if args.led_port and values["mode"] != "simulacion":
+            raise ValueError("--led-port requiere --mode simulacion para no enviar comandos al servo")
         app = SafeApp(args.data_dir, values["mode"], values["port"],
                       values["similarity_threshold"], values["camera_index"],
-                      values["authorization_seconds"], settings)
+                      values["authorization_seconds"], settings,
+                      args.led_port.strip().upper() if args.led_port else None)
     except Exception as exc:
         raise SystemExit(f"No se pudo iniciar SAFEBOX AI: {exc}") from exc
     app.mainloop()

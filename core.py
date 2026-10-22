@@ -321,7 +321,7 @@ class CommandBridge:
         self.last_command = None
         self.sequence = 0
         self.boot_id = None
-        if mode == "hardware":
+        if mode in {"hardware", "leds"}:
             if not port:
                 raise ValueError("El modo hardware requiere --port COMx")
             try:
@@ -339,11 +339,13 @@ class CommandBridge:
                 raise
 
     def send(self, command: str, timeout: float = 1.5) -> None:
-        if command not in {"OPEN", "LOCK", "DENIED", "IDLE", "PING"}:
+        allowed = ({"PING", "AUTH_OK", "AUTH_FAIL"} if self.mode == "leds" else
+                   {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
+        if command not in allowed:
             raise ValueError("Comando no permitido")
-        if self.mode == "hardware" and self.serial is None:
+        if self.mode in {"hardware", "leds"} and self.serial is None:
             raise ConnectionError("ESP32 sin conexión")
-        if self.mode == "hardware" and command != "PING" and self.boot_id is None:
+        if self.mode in {"hardware", "leds"} and command != "PING" and self.boot_id is None:
             raise ConnectionError("Falta PING inicial de la ESP32")
         if self.serial is not None:
             self.sequence += 1
@@ -381,6 +383,63 @@ class CommandBridge:
             self.serial = None
 
 
+class LedNotifier:
+    """Puerto independiente: solo PING y avisos LED, sin comandos de servo."""
+
+    def __init__(self, port: str, events: queue.Queue):
+        self.port = port
+        self.events = events
+        self.commands: queue.Queue[tuple[str, float]] = queue.Queue(maxsize=8)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name="safebox-leds")
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def notify(self, command: str) -> None:
+        if command not in {"AUTH_OK", "AUTH_FAIL"}:
+            raise ValueError("Aviso LED inválido")
+        try:
+            self.commands.put_nowait((command, time.monotonic()))
+        except queue.Full:
+            self.events.put(("led_device", False, "Cola de avisos LED saturada"))
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        bridge = None
+        next_ping = 0.0
+        try:
+            while not self.stop_event.is_set():
+                if bridge is None:
+                    try:
+                        bridge = CommandBridge("leds", self.port)
+                        next_ping = time.monotonic() + 5.0
+                        self.events.put(("led_device", True, f"LED ESP32 conectado en {self.port}"))
+                    except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
+                        self.events.put(("led_device", False, f"LED ESP32 sin conexión: {exc}"))
+                        self.stop_event.wait(5.0)
+                        continue
+                try:
+                    command, requested_at = self.commands.get(timeout=0.1)
+                except queue.Empty:
+                    command, requested_at = None, 0.0
+                try:
+                    if command is not None and time.monotonic() - requested_at <= 1.0:
+                        bridge.send(command, timeout=0.75)
+                    if time.monotonic() >= next_ping:
+                        bridge.send("PING", timeout=0.75)
+                        next_ping = time.monotonic() + 5.0
+                except (OSError, TimeoutError, ConnectionError) as exc:
+                    self.events.put(("led_device", False, f"LED ESP32 sin ACK: {exc}"))
+                    bridge.close()
+                    bridge = None
+        finally:
+            if bridge is not None:
+                bridge.close()
+
+
 class SafeBackend:
     """La cámara y el motor son dueños de sus recursos; Tk nunca sale del hilo principal."""
 
@@ -389,9 +448,12 @@ class SafeBackend:
 
     def __init__(self, data_dir: Path, mode: str, port: str | None,
                  similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD,
-                 camera_index: int = 0, authorization_seconds: int = 8):
+                 camera_index: int = 0, authorization_seconds: int = 8,
+                 led_port: str | None = None):
         if not 0.5 <= similarity_threshold <= 0.9:
             raise ValueError("El umbral de similitud debe estar entre 0.5 y 0.9")
+        if led_port and (mode != "simulacion" or not led_port.upper().startswith("COM")):
+            raise ValueError("LED ESP32 requiere simulación y un puerto COM")
         self.data_dir = data_dir
         self.mode = mode
         self.port = port
@@ -401,6 +463,7 @@ class SafeBackend:
         self.admin_ready = False
         self.physical_unknown = mode == "hardware"
         self.events: queue.Queue[tuple] = queue.Queue()
+        self.led_notifier = LedNotifier(led_port, self.events) if led_port else None
         self.commands: queue.Queue[tuple] = queue.Queue()
         self.camera_commands: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -412,6 +475,8 @@ class SafeBackend:
         self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True, name="safebox-engine")
 
     def start(self) -> None:
+        if self.led_notifier is not None:
+            self.led_notifier.start()
         self.camera_thread.start()
         self.engine_thread.start()
 
@@ -432,11 +497,14 @@ class SafeBackend:
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self.led_notifier is not None:
+            self.led_notifier.stop()
         self.commands.put(("stop", None))
         self.camera_commands.put("stop")
 
     def stopped(self) -> bool:
-        return not self.camera_thread.is_alive() and not self.engine_thread.is_alive()
+        return (not self.camera_thread.is_alive() and not self.engine_thread.is_alive() and
+                (self.led_notifier is None or not self.led_notifier.thread.is_alive()))
 
     def _camera_loop(self) -> None:
         capture = None
@@ -552,6 +620,9 @@ class SafeBackend:
 
         def record_attempt(user: str, result: str, similarity: float | None,
                            frame: np.ndarray) -> None:
+            if (result == "DENEGADO" and controller.state == LockController.LOCKED
+                    and self.led_notifier is not None):
+                self.led_notifier.notify("AUTH_FAIL")
             try:
                 history.record(user, result, similarity, frame)
                 self.events.put(("history", history.recent()))
@@ -700,6 +771,8 @@ class SafeBackend:
                             continue
                         pending_access = None
                         if controller.authorize(bridge, publish_lock):
+                            if self.led_notifier is not None:
+                                self.led_notifier.notify("AUTH_OK")
                             authorized_id = person_id
                             authorized_track = last_verified_track
                             name = store.users[person_id]
@@ -734,7 +807,9 @@ class SafeBackend:
                         publish_lock()
                     elif kind == "connect_device":
                         new_mode, new_port = value
-                        if controller.state in {LockController.UNLOCKED, LockController.PENDING}:
+                        if self.led_notifier is not None and new_mode != "simulacion":
+                            self.events.put(("configuration_error", "El modo LED solo permite cerradura simulada"))
+                        elif controller.state in {LockController.UNLOCKED, LockController.PENDING}:
                             self.events.put(("configuration_error", "Confirma el cierre antes de cambiar de modo"))
                         else:
                             try:
