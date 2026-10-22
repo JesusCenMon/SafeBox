@@ -16,11 +16,11 @@ uint32_t bootId = 0;
 uint32_t offAt = 0;
 bool ledsOn = false;
 
-void setLeds(bool on) {
-  digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
-  digitalWrite(LED_RED_PIN, on ? HIGH : LOW);
-  ledsOn = on;
-  if (!on) offAt = 0;
+void setLeds(bool blueOn, bool redOn) {
+  digitalWrite(LED_BLUE_PIN, blueOn ? HIGH : LOW);
+  digitalWrite(LED_RED_PIN, redOn ? HIGH : LOW);
+  ledsOn = blueOn || redOn;
+  if (!ledsOn) offAt = 0;
 }
 
 void reply(const char* type, unsigned long sequence, const char* command) {
@@ -45,19 +45,20 @@ void handleLine(const char* line) {
     return;
   }
   if (fields != 3 || session != bootId) {
-    setLeds(false);
+    setLeds(false, false);
     reply("ERR", sequence, command);
     return;
   }
   if (strcmp(command, "AUTH_OK") == 0) {
-    setLeds(true);
+    setLeds(true, false);
     offAt = millis() + LED_DURATION_MS;
     reply("ACK", sequence, command);
   } else if (strcmp(command, "AUTH_FAIL") == 0) {
-    setLeds(false);
+    setLeds(false, true);
+    offAt = millis() + LED_DURATION_MS;
     reply("ACK", sequence, command);
   } else {
-    setLeds(false);
+    setLeds(false, false);
     reply("ERR", sequence, command);
   }
 }
@@ -65,14 +66,14 @@ void handleLine(const char* line) {
 void setup() {
   pinMode(LED_BLUE_PIN, OUTPUT);
   pinMode(LED_RED_PIN, OUTPUT);
-  setLeds(false);
+  setLeds(false, false);
   Serial.begin(115200);
   bootId = esp_random();
 }
 
 void loop() {
   if (ledsOn && static_cast<int32_t>(millis() - offAt) >= 0) {
-    setLeds(false);
+    setLeds(false, false);
   }
   while (Serial.available() > 0) {
     const char ch = static_cast<char>(Serial.read());
@@ -89,7 +90,7 @@ void loop() {
       } else {
         lineLength = 0;
         discardingLine = true;
-        setLeds(false);
+        setLeds(false, false);
       }
     }
   }
