@@ -940,14 +940,17 @@ class SafeBackend:
                     observations.append(FaceObservation(box, current_id, current_similarity,
                                                         current_feature))
                 tracked = tracker.update(observations)
-                face_labels = [(store.users[item.person_id],
-                                "AUTORIZADO" if authorized_id == item.person_id and
-                                authorized_track == item.track_id else
-                                "PIN PENDIENTE" if pending_access is not None and
-                                pending_access[0] == item.person_id and
-                                pending_access[2] == item.track_id else "IDENTIDAD")
-                               if item.person_id and item.streak >= 4 else
-                               ("Desconocido", "DESCONOCIDO") for item in tracked]
+                face_labels = [
+                    (store.users[item.person_id],
+                     "AUTORIZADO" if authorized_id == item.person_id and
+                     authorized_track == item.track_id else
+                     "PIN PENDIENTE" if pending_access is not None and
+                     pending_access[0] == item.person_id and
+                     pending_access[2] == item.track_id else
+                     "IDENTIDAD" if item.streak >= 4 else "VERIFICANDO")
+                    if item.person_id else ("Desconocido", "DESCONOCIDO")
+                    for item in tracked
+                ]
                 # Conserva la correspondencia con los recuadros incluso si falla un rasgo.
                 boxes = [item.box for item in tracked]
                 known = [item for item in tracked if item.person_id is not None]

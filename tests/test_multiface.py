@@ -129,9 +129,20 @@ class MultiFaceTests(unittest.TestCase):
         with self.running(two_users=True) as (backend, faces, sent, ana):
             self.pump_for(backend, 1.1)
             states = [event for event in self.seen if event[0] == "state"]
-            self.assertTrue(any("Varios usuarios registrados" in event[2] and
-                                {"Ana", "Beto"}.issubset({label[0] for label in event[6]})
+            self.assertTrue(any(event[5] == [(2, 2, 20, 20), (32, 2, 20, 20)] and
+                                event[6] == [("Ana", "VERIFICANDO"), ("Beto", "VERIFICANDO")]
                                 for event in states))
+            self.assertTrue(any("Varios usuarios registrados" in event[2] and
+                                event[6] == [("Ana", "IDENTIDAD"), ("Beto", "IDENTIDAD")]
+                                for event in states))
+            faces.reverse()
+            self.seen.clear()
+            self.pump_for(backend, 0.4)
+            self.assertTrue(any(event[0] == "state" and
+                                event[5] == [(32, 2, 20, 20), (2, 2, 20, 20)] and
+                                [label[0] for label in event[6]] == ["Beto", "Ana"]
+                                for event in self.seen))
+            faces.reverse()
             self.assertNotIn("OPEN", sent)
             self.assertFalse(any(event[0] == "welcome" for event in self.seen))
             self.assertFalse(any(event[0] == "pin_required" for event in list(backend.events.queue)))

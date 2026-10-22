@@ -1304,16 +1304,19 @@ class SafeApp(ctk.CTk):
                 self.mode = mode
                 self.physical_unknown = event[3]
                 badge = ("●  LED ESP32 CONECTADO" if self.led_port and self.led_connected else
+                         "●  LED ESP32 SIN CONEXIÓN" if self.led_port and self.led_error_seen else
                          "●  LED ESP32 CONECTANDO" if self.led_port else
                          "●  HARDWARE CONECTADO" if mode == "hardware" else
                          "●  SIM · FÍSICO DESCONOCIDO" if self.physical_unknown else "●  SOLO SIMULACIÓN")
                 self.mode_badge.configure(text=badge,
-                                          text_color=AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
+                                          text_color=RED if self.led_port and self.led_error_seen else
+                                          AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
                 self.settings_device.configure(text=(f"Cerradura simulada · LEDs {self.led_port} "
-                                                     f"{'conectados' if self.led_connected else 'conectando'}") if self.led_port else
+                                                     f"{'conectados' if self.led_connected else 'sin conexión' if self.led_error_seen else 'conectando'}") if self.led_port else
                                                f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
                                                "Simulación · estado físico desconocido" if self.physical_unknown else
-                                               "Simulación · sin hardware conectado", text_color=TEXT)
+                                               "Simulación · sin hardware conectado",
+                                               text_color=RED if self.led_port and self.led_error_seen else TEXT)
                 if self.pending_settings is not None:
                     values, self.pending_settings = self.pending_settings, None
                     self.commit_settings(values)
@@ -1513,7 +1516,7 @@ class SafeApp(ctk.CTk):
             name, phase = (self.face_labels[index] if index < len(self.face_labels) else
                            ("Desconocido", "DESCONOCIDO"))
             caption = f"{name} · {phase}" if phase != "DESCONOCIDO" else name
-            color = CYAN if phase == "AUTORIZADO" else AMBER if phase == "PIN PENDIENTE" else BLUE if phase == "IDENTIDAD" else MUTED
+            color = CYAN if phase == "AUTORIZADO" else AMBER if phase == "PIN PENDIENTE" else BLUE if phase in {"IDENTIDAD", "VERIFICANDO"} else MUTED
             canvas.itemconfigure(text, text=caption, fill=color, state="normal")
             label_width = min(max(8, canvas_width - 8), max(90, len(caption) * 7 + 14))
             left = max(4, min(canvas_width - label_width - 4, offset_x + int(x * scale)))

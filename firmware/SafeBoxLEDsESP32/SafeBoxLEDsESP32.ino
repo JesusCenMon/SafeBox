@@ -5,8 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
-constexpr uint8_t LED_1_PIN = 18;
-constexpr uint8_t LED_2_PIN = 19;
+constexpr uint8_t LED_BLUE_PIN = 25;
+constexpr uint8_t LED_RED_PIN = 26;
 constexpr uint32_t LED_DURATION_MS = 3000;
 
 char lineBuffer[48];
@@ -17,8 +17,8 @@ uint32_t offAt = 0;
 bool ledsOn = false;
 
 void setLeds(bool on) {
-  digitalWrite(LED_1_PIN, on ? HIGH : LOW);
-  digitalWrite(LED_2_PIN, on ? HIGH : LOW);
+  digitalWrite(LED_BLUE_PIN, on ? HIGH : LOW);
+  digitalWrite(LED_RED_PIN, on ? HIGH : LOW);
   ledsOn = on;
   if (!on) offAt = 0;
 }
@@ -63,8 +63,8 @@ void handleLine(const char* line) {
 }
 
 void setup() {
-  pinMode(LED_1_PIN, OUTPUT);
-  pinMode(LED_2_PIN, OUTPUT);
+  pinMode(LED_BLUE_PIN, OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
   setLeds(false);
   Serial.begin(115200);
   bootId = esp_random();

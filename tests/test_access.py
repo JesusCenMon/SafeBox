@@ -73,6 +73,8 @@ class AccessTests(unittest.TestCase):
 
             backend = core.SafeBackend(root, "simulacion", None, 0.5)
             backend.led_notifier = Mock()
+            led_at = []
+            backend.led_notifier.notify.side_effect = lambda command: led_at.append((command, tuple(sent)))
             backend.camera_connected = True
             with (patch.object(core, "load_models", return_value=(object(), object())),
                   patch.object(core, "detect_faces", return_value=FACE),
@@ -107,6 +109,8 @@ class AccessTests(unittest.TestCase):
                 until("pin_success")
                 self.assertEqual(sent.count("OPEN"), 1)
                 self.assertEqual([call.args[0] for call in backend.led_notifier.notify.call_args_list].count("AUTH_OK"), 1)
+                self.assertTrue(any(command == "AUTH_OK" and commands.count("OPEN") == 1
+                                    for command, commands in led_at))
                 backend.send("confirm_closed")
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline and "LOCK" not in sent:
