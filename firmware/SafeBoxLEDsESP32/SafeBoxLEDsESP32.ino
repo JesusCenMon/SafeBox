@@ -1,6 +1,7 @@
 // SAFEBOX AI: LEDs y MG90S en ESP32-WROOM, Arduino-ESP32 3.x.
 // Ningún comando de LED mueve el servo. OPEN/LOCK requieren calibración.
 #include <Arduino.h>
+#include <Preferences.h>
 #include <esp_system.h>
 #include <stdio.h>
 #include <string.h>
@@ -20,6 +21,8 @@ constexpr uint16_t TEST_FIRST_US = 1500;
 constexpr uint16_t TEST_MAX_STEP_US = 50;
 constexpr bool CALIBRATED = SAFEBOX_OPEN_US != 0 && SAFEBOX_LOCK_US != 0;
 
+static_assert(SAFEBOX_DEMO_ONLY == 0 || SAFEBOX_DEMO_ONLY == 1,
+              "SAFEBOX_DEMO_ONLY debe ser 0 o 1");
 static_assert((SAFEBOX_OPEN_US == 0 && SAFEBOX_LOCK_US == 0) ||
               (SAFEBOX_OPEN_US >= 1000 && SAFEBOX_OPEN_US <= 2000 &&
                SAFEBOX_LOCK_US >= 1000 && SAFEBOX_LOCK_US <= 2000 &&
@@ -32,7 +35,11 @@ char lineBuffer[64];
 size_t lineLength = 0;
 bool discardingLine = false;
 bool servoReady = false;
+bool storageReady = false;
 bool ledsOn = false;
+Preferences preferences;
+uint16_t openPulseUs = SAFEBOX_OPEN_US;
+uint16_t lockPulseUs = SAFEBOX_LOCK_US;
 uint16_t lastTestPulse = 0;
 uint32_t bootId = 0;
 uint32_t blueOffAt = 0;
@@ -67,7 +74,19 @@ void replyStatus(unsigned long sequence) {
   Serial.print(" SERVO_STATUS ");
   Serial.print(bootId, HEX);
   Serial.print(' ');
-  Serial.println(!servoReady ? "ERROR" : CALIBRATED ? "LISTO" : "NO_CONFIGURADO");
+  Serial.println(!servoReady || !storageReady ? "ERROR" : !CALIBRATED ? "NO_CONFIGURADO" :
+                 SAFEBOX_DEMO_ONLY ? "DEMO" : "LISTO");
+}
+
+void replyConfig(unsigned long sequence) {
+  Serial.print("ACK ");
+  Serial.print(sequence);
+  Serial.print(" SERVO_CONFIG ");
+  Serial.print(bootId, HEX);
+  Serial.print(' ');
+  Serial.print(openPulseUs);
+  Serial.print(' ');
+  Serial.println(lockPulseUs);
 }
 
 void handleLine(const char* line) {
@@ -76,8 +95,9 @@ void handleLine(const char* line) {
   unsigned long sequence = 0;
   unsigned long session = 0;
   unsigned int pulse = 0;
-  const int fields = sscanf(line, "%15s %lu %lx %u %c",
-                            command, &sequence, &session, &pulse, &extra);
+  unsigned int secondPulse = 0;
+  const int fields = sscanf(line, "%15s %lu %lx %u %u %c",
+                            command, &sequence, &session, &pulse, &secondPulse, &extra);
   if (fields < 2) return;
   if (strcmp(command, "PING") == 0) {
     if (fields == 2) lastContactAt = millis();
@@ -93,6 +113,25 @@ void handleLine(const char* line) {
   if (strcmp(command, "SERVO_STATUS") == 0 && fields == 3) {
     lastContactAt = millis();
     replyStatus(sequence);
+  } else if (strcmp(command, "SERVO_CONFIG") == 0 && fields == 3) {
+    lastContactAt = millis();
+    replyConfig(sequence);
+  } else if (strcmp(command, "SET_SERVO") == 0 && fields == 5) {
+    if (!SAFEBOX_DEMO_ONLY || !storageReady || !servoReady ||
+        pulse < 1000 || pulse > 2000 || secondPulse < 1000 ||
+        secondPulse > 2000 || pulse == secondPulse) {
+      reply("ERR", sequence, command);
+      return;
+    }
+    const uint32_t pair = (static_cast<uint32_t>(pulse) << 16) | secondPulse;
+    if (preferences.putUInt("servo_pair", pair) != sizeof(pair)) {
+      reply("ERR", sequence, command);
+      return;
+    }
+    openPulseUs = pulse;
+    lockPulseUs = secondPulse;
+    lastContactAt = millis();
+    reply("ACK", sequence, command);
   } else if (strcmp(command, "TEST_SERVO") == 0 && fields == 4) {
     const bool inRange = pulse >= TEST_MIN_US && pulse <= TEST_MAX_US;
     const bool safeStep = lastTestPulse == 0 ? pulse == TEST_FIRST_US :
@@ -115,14 +154,14 @@ void handleLine(const char* line) {
     lastContactAt = millis();
     reply("ACK", sequence, command);
   } else if (strcmp(command, "OPEN") == 0 && fields == 3) {
-    if (!CALIBRATED || !writeServoPulse(SAFEBOX_OPEN_US)) {
+    if (!CALIBRATED || !storageReady || !writeServoPulse(openPulseUs)) {
       reply("ERR", sequence, command);
       return;
     }
     lastContactAt = millis();
     reply("ACK", sequence, command);
   } else if (strcmp(command, "LOCK") == 0 && fields == 3) {
-    if (!CALIBRATED || !writeServoPulse(SAFEBOX_LOCK_US)) {
+    if (!CALIBRATED || !storageReady || !writeServoPulse(lockPulseUs)) {
       reply("ERR", sequence, command);
       return;
     }
@@ -157,6 +196,18 @@ void setup() {
   bootId = esp_random();
   servoReady = ledcAttach(SERVO_PIN, 50, 16);
   if (servoReady) ledcWrite(SERVO_PIN, 0);  // Sin posición ni movimiento al arrancar.
+  storageReady = preferences.begin("safebox", false);
+  if (storageReady && SAFEBOX_DEMO_ONLY) {
+    const uint32_t pair = preferences.getUInt("servo_pair",
+        (static_cast<uint32_t>(SAFEBOX_OPEN_US) << 16) | SAFEBOX_LOCK_US);
+    const uint16_t savedOpen = pair >> 16;
+    const uint16_t savedLock = pair & 0xFFFF;
+    if (savedOpen >= 1000 && savedOpen <= 2000 &&
+        savedLock >= 1000 && savedLock <= 2000 && savedOpen != savedLock) {
+      openPulseUs = savedOpen;
+      lockPulseUs = savedLock;
+    }
+  }
   lastContactAt = millis();
 }
 

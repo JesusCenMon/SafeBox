@@ -24,6 +24,9 @@ class FakeSerial:
         self.silent = False
         self.disconnect = False
         self.boot_id = "A1B2C3D4"
+        self.servo_status = "NO_CONFIGURADO"
+        self.open_us = 2000
+        self.lock_us = 1500
 
     def write(self, data):
         if self.disconnect:
@@ -31,15 +34,20 @@ class FakeSerial:
         self.writes.append(data)
         parts = data.decode().strip().split()
         command, seq = parts[:2]
-        expected_len = 4 if command == "TEST_SERVO" else 2 if command == "PING" else 3
+        expected_len = (5 if command == "SET_SERVO" else
+                        4 if command == "TEST_SERVO" else 2 if command == "PING" else 3)
         if len(parts) != expected_len or (command != "PING" and parts[2] != self.boot_id):
             self.reply = f"ERR {seq} {command} {self.boot_id}\n".encode()
             return
+        if command == "SET_SERVO":
+            self.open_us, self.lock_us = int(parts[3]), int(parts[4])
         self.reply = (b"" if self.silent else
                       b"ACK\n" if self.malformed_ack else
                       f"ACK 999 {command} {self.boot_id}\n".encode() if self.wrong_ack else
-                      f"ACK {seq} {command} {self.boot_id} NO_CONFIGURADO\n".encode()
+                      f"ACK {seq} {command} {self.boot_id} {self.servo_status}\n".encode()
                       if command == "SERVO_STATUS" else
+                      f"ACK {seq} {command} {self.boot_id} {self.open_us} {self.lock_us}\n".encode()
+                      if command == "SERVO_CONFIG" else
                       f"ACK {seq} {command} {self.boot_id}\n".encode())
 
     def readline(self):
@@ -180,6 +188,20 @@ class SerialTests(unittest.TestCase):
             ])
             bridge.close()
 
+        demo = FakeSerial()
+        demo.servo_status = "DEMO"
+        with patch.dict(sys.modules, {"serial": types.SimpleNamespace(Serial=lambda **_kw: demo)}):
+            bridge = core.CommandBridge("hardware", "COM4")
+            self.assertEqual(bridge.servo_status, "DEMO")
+            self.assertEqual(bridge.servo_pulses, (2000, 1500))
+            with self.assertRaises(ValueError):
+                bridge.send("SET_SERVO", servo_pulses=(2000, 2000))
+            bridge.send("SET_SERVO", servo_pulses=(1900, 1450))
+            self.assertEqual(bridge.servo_pulses, (1900, 1450))
+            self.assertEqual(demo.writes[-1], b"SET_SERVO 4 A1B2C3D4 1900 1450\n")
+            self.assertFalse(any(b"OPEN" in write or b"LOCK" in write for write in demo.writes))
+            bridge.close()
+
     def test_led_notifier_runs_outside_engine_and_reports_bad_ack(self):
         device = FakeSerial()
         events = queue.Queue()
@@ -316,12 +338,15 @@ class SerialTests(unittest.TestCase):
             def __init__(self, mode, _port):
                 self.mode = mode
                 self.serial = object()
-                self.servo_status = "LISTO"
+                self.servo_status = "DEMO"
+                self.servo_pulses = (2000, 1500)
                 self.commands = ["PING", "SERVO_STATUS"]
                 instances.append(self)
 
-            def send(self, command, timeout=1.5):
+            def send(self, command, timeout=1.5, *, servo_pulses=None):
                 self.commands.append(command)
+                if command == "SET_SERVO":
+                    self.servo_pulses = servo_pulses
 
             def close(self):
                 self.serial = None
@@ -360,6 +385,10 @@ class SerialTests(unittest.TestCase):
                     backend.send("admin_ready", True)
                     until("device")
                     self.assertEqual(until("lock")[1], "ESPERANDO CIERRE")
+                    self.assertNotIn("OPEN", instances[0].commands)
+                    backend.send("set_servo_config", (1950, 1500))
+                    until("servo_config_saved")
+                    self.assertEqual(instances[0].servo_pulses, (1950, 1500))
                     self.assertNotIn("OPEN", instances[0].commands)
                     backend.send("confirm_closed")
                     self.assertEqual(until("lock", predicate=lambda e: e[1] == "BLOQUEADA")[1], "BLOQUEADA")

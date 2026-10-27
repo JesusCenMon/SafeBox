@@ -326,6 +326,7 @@ class CommandBridge:
         self.sequence = 0
         self.boot_id = None
         self.servo_status: str | None = None
+        self.servo_pulses: tuple[int, int] | None = None
         if mode in {"hardware", "leds"}:
             if not port:
                 raise ValueError("El modo hardware requiere --port COMx")
@@ -349,15 +350,19 @@ class CommandBridge:
                             raise
                 if mode == "hardware":
                     self.servo_status = self.send("SERVO_STATUS")
+                    if self.servo_status == "DEMO":
+                        self.servo_pulses = self.send("SERVO_CONFIG")
             except Exception:
                 self.close()
                 raise
 
     def send(self, command: str, timeout: float = 1.5, *,
-             close_on_error: bool = True, pulse_us: int | None = None) -> str | None:
+             close_on_error: bool = True, pulse_us: int | None = None,
+             servo_pulses: tuple[int, int] | None = None) -> str | tuple[int, int] | None:
         allowed = ({"PING", "AUTH_OK", "AUTH_FAIL", "LED_OFF"} if self.mode == "leds" else
                    {"OPEN", "LOCK", "DENIED", "IDLE", "PING", "AUTH_OK", "AUTH_FAIL",
-                    "LED_OFF", "SERVO_STATUS", "TEST_SERVO", "SERVO_STOP"}
+                    "LED_OFF", "SERVO_STATUS", "SERVO_CONFIG", "SET_SERVO",
+                    "TEST_SERVO", "SERVO_STOP"}
                    if self.mode == "hardware" else {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
         if command not in allowed:
             raise ValueError("Comando no permitido")
@@ -366,6 +371,13 @@ class CommandBridge:
                 raise ValueError("Pulso de prueba: 1000 a 2000 microsegundos")
         elif pulse_us is not None:
             raise ValueError("Este comando no acepta un pulso")
+        if command == "SET_SERVO":
+            if (not isinstance(servo_pulses, tuple) or len(servo_pulses) != 2 or
+                    any(type(value) is not int or not 1000 <= value <= 2000
+                        for value in servo_pulses) or servo_pulses[0] == servo_pulses[1]):
+                raise ValueError("Los dos pulsos deben ser distintos y estar entre 1000 y 2000 µs")
+        elif servo_pulses is not None:
+            raise ValueError("Este comando no acepta posiciones")
         if self.mode in {"hardware", "leds"} and self.serial is None:
             raise ConnectionError("ESP32 sin conexión")
         if self.mode in {"hardware", "leds"} and command != "PING" and self.boot_id is None:
@@ -377,13 +389,16 @@ class CommandBridge:
             try:
                 line = (f"PING {sequence}\n" if command == "PING" else
                         f"TEST_SERVO {sequence} {self.boot_id} {pulse_us}\n" if command == "TEST_SERVO" else
+                        f"SET_SERVO {sequence} {self.boot_id} {servo_pulses[0]} {servo_pulses[1]}\n"
+                        if command == "SET_SERVO" else
                         f"{command} {sequence} {self.boot_id}\n")
                 self.serial.write(line.encode("ascii"))
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     line = self.serial.readline().decode("ascii", errors="replace").strip()
                     parts = line.split()
-                    if (len(parts) == (5 if command == "SERVO_STATUS" else 4) and
+                    if (len(parts) == (6 if command == "SERVO_CONFIG" else
+                                       5 if command == "SERVO_STATUS" else 4) and
                             parts[:3] == ["ACK", str(sequence), command] and
                             all(char in "0123456789ABCDEFabcdef" for char in parts[3])):
                         if self.boot_id is None:
@@ -391,12 +406,26 @@ class CommandBridge:
                         elif self.boot_id != parts[3].upper():
                             raise ConnectionError("La ESP32 se reinició; confirma el cierre antes de abrir")
                         if command == "SERVO_STATUS":
-                            if parts[4] not in {"LISTO", "NO_CONFIGURADO", "ERROR"}:
+                            if parts[4] not in {"LISTO", "DEMO", "NO_CONFIGURADO", "ERROR"}:
                                 raise ConnectionError(f"Estado del servo inválido: {parts[4]}")
                             status = parts[4]
+                        elif command == "SERVO_CONFIG":
+                            try:
+                                open_us, lock_us = int(parts[4]), int(parts[5])
+                            except ValueError as exc:
+                                raise ConnectionError("Pulsos del servo inválidos") from exc
+                            if (not 1000 <= open_us <= 2000 or not 1000 <= lock_us <= 2000 or
+                                    open_us == lock_us):
+                                raise ConnectionError("Pulsos del servo fuera de rango")
+                            self.servo_pulses = (open_us, lock_us)
+                            status = self.servo_pulses
+                        elif command == "SET_SERVO":
+                            self.servo_pulses = servo_pulses
                         break
                     if parts and parts[0] in {"ACK", "ERR"}:
                         if parts[:3] == ["ERR", str(sequence), command]:
+                            if command == "SET_SERVO":
+                                raise ValueError("ESP32 rechazó los pulsos del MG90S; comprueba el modo DEMO")
                             if command in {"TEST_SERVO", "SERVO_STOP"}:
                                 raise ValueError(f"ESP32 rechazó {command}; revisa pulso, pasos y PWM")
                             raise ConnectionError(f"ESP32 rechazó {command}")
@@ -729,9 +758,11 @@ class SafeBackend:
                 bridge = CommandBridge(self.mode, self.port)
                 if self.mode == "hardware":
                     self.servo_status = bridge.servo_status or "ERROR"
-                    if self.servo_status == "LISTO":
+                    if self.servo_status in {"LISTO", "DEMO"}:
                         controller.state = LockController.WAITING_CLOSE
-                        controller.reason = "Servo listo; confirma el cierre antes de bloquear"
+                        controller.reason = ("Demo MG90S sin puerta; confirma el retorno al centro" if
+                                             self.servo_status == "DEMO" else
+                                             "Servo listo; confirma el cierre antes de bloquear")
                     else:
                         controller.fail("Servo sin calibrar" if self.servo_status == "NO_CONFIGURADO"
                                         else "No se pudo inicializar PWM del servo")
@@ -740,6 +771,8 @@ class SafeBackend:
                 controller.fail(f"ESP32 sin conexión: {exc}")
                 self.servo_status = "ERROR"
             self.events.put(("servo_status", self.servo_status if self.mode == "hardware" else "NO CONECTADO"))
+            if self.mode == "hardware" and bridge is not None and getattr(bridge, "servo_pulses", None) is not None:
+                self.events.put(("servo_config", *bridge.servo_pulses))
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
@@ -880,6 +913,24 @@ class SafeBackend:
                             controller.confirm_closed(bridge)
                         authorized_id = None
                         publish_lock()
+                    elif kind == "set_servo_config":
+                        if (self.mode != "hardware" or bridge is None or
+                                self.servo_status != "DEMO" or
+                                controller.state not in {LockController.LOCKED,
+                                                         LockController.WAITING_CLOSE}):
+                            self.events.put(("servo_config_error",
+                                             "Configura el MG90S solo en DEMO, sin apertura pendiente"))
+                        else:
+                            try:
+                                bridge.send("SET_SERVO", servo_pulses=value)
+                                self.events.put(("servo_config", *bridge.servo_pulses))
+                                self.events.put(("servo_config_saved",))
+                            except ValueError as exc:
+                                self.events.put(("servo_config_error", str(exc)))
+                            except (OSError, TimeoutError, ConnectionError) as exc:
+                                controller.fail(f"Configuración MG90S sin ACK: {exc}")
+                                publish_lock()
+                                self.events.put(("servo_config_error", controller.reason))
                     elif kind == "test_servo":
                         if self.mode != "hardware" or bridge is None or self.servo_status != "NO_CONFIGURADO":
                             self.events.put(("servo_test_result", False,
@@ -933,9 +984,11 @@ class SafeBackend:
                                     if self.led_port and self.led_notifier is None:
                                         self.led_notifier = LedNotifier(self.led_port, self.events)
                                         self.led_notifier.start()
-                                elif self.servo_status == "LISTO":
+                                elif self.servo_status in {"LISTO", "DEMO"}:
                                     controller.state = LockController.WAITING_CLOSE
-                                    controller.reason = "Servo listo; confirma el cierre antes de bloquear"
+                                    controller.reason = ("Demo MG90S sin puerta; confirma el retorno al centro" if
+                                                         self.servo_status == "DEMO" else
+                                                         "Servo listo; confirma el cierre antes de bloquear")
                                 else:
                                     controller.fail("Servo sin calibrar" if self.servo_status == "NO_CONFIGURADO"
                                                     else "No se pudo inicializar PWM del servo")
@@ -945,6 +998,8 @@ class SafeBackend:
                                 self.events.put(("device", new_mode, new_port, self.physical_unknown))
                                 self.events.put(("servo_status", self.servo_status if new_mode == "hardware"
                                                  else "NO CONECTADO"))
+                                if new_mode == "hardware" and getattr(candidate, "servo_pulses", None) is not None:
+                                    self.events.put(("servo_config", *candidate.servo_pulses))
                                 publish_lock()
                             except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
                                 if stopped_led and self.led_port:

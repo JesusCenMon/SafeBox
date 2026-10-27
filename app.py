@@ -87,6 +87,7 @@ class SafeApp(ctk.CTk):
         self.led_error_seen = False
         self.led_error_message: str | None = None
         self.servo_status = "NO CONECTADO"
+        self.servo_pulses: tuple[int, int] | None = None
         self.backend = SafeBackend(data_dir, mode, port, similarity_threshold,
                                    camera_index, authorization_seconds,
                                    led_port=led_port)
@@ -499,6 +500,19 @@ class SafeApp(ctk.CTk):
         ctk.CTkButton(servo_actions, text="Detener PWM", width=140, height=36,
                       corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
                       command=self.stop_servo_signal).pack(side="left")
+        self.servo_open_entry = self.setting_input(settings_card, 16, "Autorización · µs", "—")
+        self.servo_lock_entry = self.setting_input(settings_card, 17, "Retorno · µs", "—")
+        self.servo_save_button = ctk.CTkButton(
+            settings_card, text="Guardar recorrido MG90S", width=210, height=36,
+            corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
+            command=lambda: self.require_admin("Ajustar MG90S", self.save_servo_config))
+        self.servo_save_button.grid(row=18, column=0, sticky="w", padx=24, pady=(6, 4))
+        ctk.CTkLabel(settings_card,
+                     text="Solo DEMO sin puerta · 1000–2000 µs · guardar no mueve el servo."
+                          " Mide otras posiciones antes de instalar el pestillo real.",
+                     text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
+                     wraplength=650, justify="left").grid(
+            row=19, column=0, sticky="w", padx=24, pady=(0, 14))
 
     @staticmethod
     def setting_input(parent, row: int, title: str, value: str) -> ctk.CTkEntry:
@@ -1112,6 +1126,22 @@ class SafeApp(ctk.CTk):
             return
         self.backend.send("servo_stop")
 
+    def save_servo_config(self) -> None:
+        if self.mode != "hardware" or self.servo_status != "DEMO":
+            self.notify("Conecta COM4 en modo hardware DEMO antes de ajustar el MG90S", error=True)
+            return
+        try:
+            pulses = (int(self.servo_open_entry.get().strip()),
+                      int(self.servo_lock_entry.get().strip()))
+            if (pulses[0] == pulses[1] or
+                    any(not 1000 <= pulse <= 2000 for pulse in pulses)):
+                raise ValueError
+        except ValueError:
+            self.notify("Usa dos pulsos distintos entre 1000 y 2000 µs", error=True)
+            return
+        self.servo_save_button.configure(state="disabled")
+        self.backend.send("set_servo_config", pulses)
+
     def open_registration(self, name: str = "", authorized: bool = False) -> None:
         if not authorized:
             self.require_admin("Registrar rostro",
@@ -1389,8 +1419,21 @@ class SafeApp(ctk.CTk):
                 self.servo_value.configure(text=self.servo_status, text_color=color)
                 self.settings_servo.configure(text=(self.servo_status +
                     (" · PWM aceptado, posición física no verificada" if self.servo_status == "LISTO" else
+                     " · demostración sin puerta; pestillo no calibrado" if self.servo_status == "DEMO" else
                      " · configura calibration.h tras probar sin puerta" if self.servo_status == "NO CONFIGURADO" else "")),
                     text_color=color)
+            elif kind == "servo_config":
+                self.servo_pulses = (event[1], event[2])
+                for entry, pulse in ((self.servo_open_entry, event[1]),
+                                     (self.servo_lock_entry, event[2])):
+                    entry.delete(0, "end")
+                    entry.insert(0, str(pulse))
+                self.servo_save_button.configure(state="normal")
+            elif kind == "servo_config_saved":
+                self.notify("Recorrido MG90S guardado en la ESP32; no se ordenó movimiento")
+            elif kind == "servo_config_error":
+                self.servo_save_button.configure(state="normal")
+                self.notify(event[1], error=True)
             elif kind == "servo_test_result":
                 self.notify(event[2], error=not event[1])
             elif kind == "configuration_error":
