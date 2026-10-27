@@ -325,6 +325,7 @@ class CommandBridge:
         self.last_command = None
         self.sequence = 0
         self.boot_id = None
+        self.servo_status: str | None = None
         if mode in {"hardware", "leds"}:
             if not port:
                 raise ValueError("El modo hardware requiere --port COMx")
@@ -346,16 +347,25 @@ class CommandBridge:
                     except (OSError, TimeoutError, ConnectionError):
                         if attempt == self.INITIAL_PING_RETRIES:
                             raise
+                if mode == "hardware":
+                    self.servo_status = self.send("SERVO_STATUS")
             except Exception:
                 self.close()
                 raise
 
     def send(self, command: str, timeout: float = 1.5, *,
-             close_on_error: bool = True) -> None:
+             close_on_error: bool = True, pulse_us: int | None = None) -> str | None:
         allowed = ({"PING", "AUTH_OK", "AUTH_FAIL", "LED_OFF"} if self.mode == "leds" else
-                   {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
+                   {"OPEN", "LOCK", "DENIED", "IDLE", "PING", "AUTH_OK", "AUTH_FAIL",
+                    "LED_OFF", "SERVO_STATUS", "TEST_SERVO", "SERVO_STOP"}
+                   if self.mode == "hardware" else {"OPEN", "LOCK", "DENIED", "IDLE", "PING"})
         if command not in allowed:
             raise ValueError("Comando no permitido")
+        if command == "TEST_SERVO":
+            if not isinstance(pulse_us, int) or not 1300 <= pulse_us <= 1700:
+                raise ValueError("Pulso de prueba: 1300 a 1700 microsegundos")
+        elif pulse_us is not None:
+            raise ValueError("Este comando no acepta un pulso")
         if self.mode in {"hardware", "leds"} and self.serial is None:
             raise ConnectionError("ESP32 sin conexión")
         if self.mode in {"hardware", "leds"} and command != "PING" and self.boot_id is None:
@@ -363,23 +373,32 @@ class CommandBridge:
         if self.serial is not None:
             self.sequence += 1
             sequence = self.sequence
+            status = None
             try:
                 line = (f"PING {sequence}\n" if command == "PING" else
+                        f"TEST_SERVO {sequence} {self.boot_id} {pulse_us}\n" if command == "TEST_SERVO" else
                         f"{command} {sequence} {self.boot_id}\n")
                 self.serial.write(line.encode("ascii"))
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     line = self.serial.readline().decode("ascii", errors="replace").strip()
                     parts = line.split()
-                    if (len(parts) == 4 and parts[:3] == ["ACK", str(sequence), command] and
+                    if (len(parts) == (5 if command == "SERVO_STATUS" else 4) and
+                            parts[:3] == ["ACK", str(sequence), command] and
                             all(char in "0123456789ABCDEFabcdef" for char in parts[3])):
                         if self.boot_id is None:
                             self.boot_id = parts[3].upper()
                         elif self.boot_id != parts[3].upper():
                             raise ConnectionError("La ESP32 se reinició; confirma el cierre antes de abrir")
+                        if command == "SERVO_STATUS":
+                            if parts[4] not in {"LISTO", "NO_CONFIGURADO", "ERROR"}:
+                                raise ConnectionError(f"Estado del servo inválido: {parts[4]}")
+                            status = parts[4]
                         break
                     if parts and parts[0] in {"ACK", "ERR"}:
                         if parts[:3] == ["ERR", str(sequence), command]:
+                            if command in {"TEST_SERVO", "SERVO_STOP"}:
+                                raise ValueError(f"ESP32 rechazó {command}; revisa pulso, pasos y PWM")
                             raise ConnectionError(f"ESP32 rechazó {command}")
                         raise ConnectionError(f"Respuesta serial incorrecta para {command}: {line}")
                 else:
@@ -390,6 +409,7 @@ class CommandBridge:
                 raise
         if command != "PING":
             self.last_command = command
+        return status if self.serial is not None else None
 
     def close(self) -> None:
         if self.serial is not None:
@@ -502,8 +522,10 @@ class SafeBackend:
         self.authorization_seconds = authorization_seconds
         self.admin_ready = False
         self.physical_unknown = mode == "hardware"
+        self.led_port = led_port
+        self.servo_status = "NO_CONFIGURADO"
         self.events: queue.Queue[tuple] = queue.Queue()
-        self.led_notifier = LedNotifier(led_port, self.events) if led_port else None
+        self.led_notifier = LedNotifier(led_port, self.events) if led_port and mode == "simulacion" else None
         self.commands: queue.Queue[tuple] = queue.Queue()
         self.camera_commands: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -644,7 +666,13 @@ class SafeBackend:
             led_command = ("AUTH_FAIL" if name == "DENEGADO" else
                            "AUTH_OK" if name == "AUTORIZADO" else "LED_OFF")
             if led_command != last_led_command:
-                if self.led_notifier is not None:
+                if self.mode == "hardware" and bridge is not None and bridge.serial is not None:
+                    try:
+                        bridge.send(led_command, timeout=0.75)
+                    except (OSError, TimeoutError, ConnectionError) as exc:
+                        controller.fail(f"LED ESP32 sin respuesta: {exc}")
+                        publish_lock()
+                elif self.led_notifier is not None:
                     self.led_notifier.notify(led_command)
                 last_led_command = led_command
             visible_boxes = (boxes if boxes is not None else
@@ -661,6 +689,13 @@ class SafeBackend:
             nonlocal device_error_reported
             self.events.put(("lock", controller.state, controller.reason))
             if (self.mode == "hardware" and controller.state == LockController.ERROR and
+                    not (self.servo_status == "NO_CONFIGURADO" and bridge is not None and
+                         bridge.serial is not None) and self.servo_status != "ERROR"):
+                self.servo_status = "ERROR"
+                self.events.put(("servo_status", "ERROR"))
+            if (self.mode == "hardware" and controller.state == LockController.ERROR and
+                    not (self.servo_status == "NO_CONFIGURADO" and bridge is not None and
+                         bridge.serial is not None) and
                     not device_error_reported):
                 self.events.put(("device_error", controller.reason))
                 device_error_reported = True
@@ -681,12 +716,6 @@ class SafeBackend:
             pending_access = None
             if self.frame is not None:
                 record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
-            if controller.state == LockController.LOCKED and bridge is not None:
-                try:
-                    bridge.send("DENIED")
-                except (OSError, TimeoutError, ConnectionError) as exc:
-                    controller.fail(f"ESP32 sin respuesta: {exc}")
-                    publish_lock()
             self.events.put(("pin_expired", reason))
 
         try:
@@ -697,11 +726,18 @@ class SafeBackend:
             try:
                 bridge = CommandBridge(self.mode, self.port)
                 if self.mode == "hardware":
-                    controller.state = LockController.WAITING_CLOSE
-                    controller.reason = "Conexión verificada; confirma el cierre antes de bloquear"
+                    self.servo_status = bridge.servo_status or "ERROR"
+                    if self.servo_status == "LISTO":
+                        controller.state = LockController.WAITING_CLOSE
+                        controller.reason = "Servo listo; confirma el cierre antes de bloquear"
+                    else:
+                        controller.fail("Servo sin calibrar" if self.servo_status == "NO_CONFIGURADO"
+                                        else "No se pudo inicializar PWM del servo")
                 self.events.put(("device", self.mode, self.port, self.physical_unknown))
             except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
                 controller.fail(f"ESP32 sin conexión: {exc}")
+                self.servo_status = "ERROR"
+            self.events.put(("servo_status", self.servo_status if self.mode == "hardware" else "NO CONECTADO"))
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
@@ -805,13 +841,6 @@ class SafeBackend:
                             state("DENEGADO", "PIN de acceso incorrecto")
                             if self.frame is not None:
                                 record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
-                            try:
-                                bridge.send("DENIED")
-                            except (OSError, TimeoutError, ConnectionError) as error:
-                                controller.fail(f"ESP32 sin respuesta: {error}")
-                                pending_access = None
-                                self.events.put(("pin_expired", controller.reason))
-                                publish_lock()
                             continue
                         pending_access = None
                         if controller.authorize(bridge, publish_lock):
@@ -847,29 +876,76 @@ class SafeBackend:
                             controller.confirm_closed(bridge)
                         authorized_id = None
                         publish_lock()
-                    elif kind == "connect_device":
-                        new_mode, new_port = value
-                        if self.led_notifier is not None and new_mode != "simulacion":
-                            self.events.put(("configuration_error", "El modo LED solo permite cerradura simulada"))
-                        elif controller.state in {LockController.UNLOCKED, LockController.PENDING}:
-                            self.events.put(("configuration_error", "Confirma el cierre antes de cambiar de modo"))
+                    elif kind == "test_servo":
+                        if self.mode != "hardware" or bridge is None or self.servo_status != "NO_CONFIGURADO":
+                            self.events.put(("servo_test_result", False,
+                                             "Prueba disponible solo en hardware sin calibrar"))
                         else:
                             try:
+                                bridge.send("TEST_SERVO", pulse_us=value)
+                                self.events.put(("servo_test_result", True,
+                                                 f"PWM aceptado: {value} µs; verifica el movimiento real"))
+                            except ValueError as exc:
+                                self.events.put(("servo_test_result", False, str(exc)))
+                            except (OSError, TimeoutError, ConnectionError) as exc:
+                                controller.fail(f"Prueba del servo sin ACK: {exc}")
+                                self.servo_status = "ERROR"
+                                self.events.put(("servo_status", "ERROR"))
+                                self.events.put(("servo_test_result", False, controller.reason))
+                                publish_lock()
+                    elif kind == "servo_stop":
+                        if (self.mode == "hardware" and bridge is not None and
+                                self.servo_status == "NO_CONFIGURADO"):
+                            try:
+                                bridge.send("SERVO_STOP")
+                                self.events.put(("servo_test_result", True, "Señal PWM detenida"))
+                            except (OSError, TimeoutError, ConnectionError, ValueError) as exc:
+                                self.events.put(("servo_test_result", False, str(exc)))
+                    elif kind == "connect_device":
+                        new_mode, new_port = value
+                        if controller.state in {LockController.UNLOCKED, LockController.PENDING}:
+                            self.events.put(("configuration_error", "Confirma el cierre antes de cambiar de modo"))
+                        else:
+                            stopped_led = False
+                            try:
+                                if new_mode == "hardware" and self.led_notifier is not None:
+                                    self.led_notifier.stop()
+                                    self.led_notifier.thread.join(16)
+                                    if self.led_notifier.thread.is_alive():
+                                        raise RuntimeError("El puerto LED aún se está cerrando; intenta de nuevo")
+                                    self.led_notifier = None
+                                    stopped_led = True
                                 candidate = CommandBridge(new_mode, new_port)
                                 if bridge is not None:
                                     bridge.close()
                                 bridge = candidate
                                 self.mode, self.port = new_mode, new_port
                                 self.physical_unknown = self.physical_unknown or new_mode == "hardware"
-                                controller.state = (LockController.LOCKED if new_mode == "simulacion"
-                                                    else LockController.WAITING_CLOSE)
-                                controller.reason = ("Simulación activa; estado físico desconocido" if new_mode == "simulacion" else
-                                                     "ESP32 conectada; confirma el cierre")
+                                self.servo_status = (candidate.servo_status or "ERROR"
+                                                     if new_mode == "hardware" else "NO_CONFIGURADO")
+                                if new_mode == "simulacion":
+                                    controller.state = LockController.LOCKED
+                                    controller.reason = "Simulación activa; estado físico desconocido" if self.physical_unknown else "Simulación activa"
+                                    if self.led_port and self.led_notifier is None:
+                                        self.led_notifier = LedNotifier(self.led_port, self.events)
+                                        self.led_notifier.start()
+                                elif self.servo_status == "LISTO":
+                                    controller.state = LockController.WAITING_CLOSE
+                                    controller.reason = "Servo listo; confirma el cierre antes de bloquear"
+                                else:
+                                    controller.fail("Servo sin calibrar" if self.servo_status == "NO_CONFIGURADO"
+                                                    else "No se pudo inicializar PWM del servo")
+                                last_led_command = "LED_OFF"
                                 next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
                                 device_error_reported = False
                                 self.events.put(("device", new_mode, new_port, self.physical_unknown))
+                                self.events.put(("servo_status", self.servo_status if new_mode == "hardware"
+                                                 else "NO CONECTADO"))
                                 publish_lock()
                             except (OSError, ValueError, RuntimeError, TimeoutError, ConnectionError) as exc:
+                                if stopped_led and self.led_port:
+                                    self.led_notifier = LedNotifier(self.led_port, self.events)
+                                    self.led_notifier.start()
                                 self.events.put(("configuration_error", str(exc)))
                     elif kind == "stats":
                         self.events.put(("stats", history.stats()))
@@ -920,12 +996,6 @@ class SafeBackend:
                         prompted_id = None
                         authorized_id = None
                         last_verified_id = None
-                        if logged_key is not None and controller.state == LockController.LOCKED and bridge is not None:
-                            try:
-                                bridge.send("IDLE")
-                            except (OSError, TimeoutError, ConnectionError) as exc:
-                                controller.fail(f"ESP32 sin respuesta: {exc}")
-                                publish_lock()
                         logged_key = None
                     if enrolling_name:
                         state("REGISTRANDO", "Muestra un rostro para continuar", enrolling_name)
@@ -1037,12 +1107,6 @@ class SafeBackend:
                         key = f"no-pin:{person_id}"
                         if logged_key != key:
                             record_attempt("Desconocido", "DENEGADO", similarity, frame)
-                            if controller.state == LockController.LOCKED and bridge is not None:
-                                try:
-                                    bridge.send("DENIED")
-                                except (OSError, TimeoutError, ConnectionError) as exc:
-                                    controller.fail(f"ESP32 sin respuesta: {exc}")
-                                    publish_lock()
                             logged_key = key
                     elif controller.state != LockController.LOCKED or bridge is None:
                         state("VERIFICANDO", "Cerradura no disponible para una nueva apertura",
@@ -1063,12 +1127,6 @@ class SafeBackend:
                     state("DENEGADO", detail, "Desconocido", similarity, boxes)
                     if logged_key != "unknown":
                         record_attempt("Desconocido", "DENEGADO", similarity, frame)
-                        if controller.state == LockController.LOCKED and bridge is not None:
-                            try:
-                                bridge.send("DENIED")
-                            except (OSError, TimeoutError, ConnectionError) as exc:
-                                controller.fail(f"ESP32 sin respuesta: {exc}")
-                                publish_lock()
                         logged_key = "unknown"
         except Exception as exc:
             self.events.put(("engine_error", str(exc)))

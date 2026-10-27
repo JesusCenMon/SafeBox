@@ -86,6 +86,7 @@ class SafeApp(ctk.CTk):
         self.led_connected = False
         self.led_error_seen = False
         self.led_error_message: str | None = None
+        self.servo_status = "NO CONECTADO"
         self.backend = SafeBackend(data_dir, mode, port, similarity_threshold,
                                    camera_index, authorization_seconds,
                                    led_port=led_port)
@@ -311,6 +312,7 @@ class SafeApp(ctk.CTk):
         led_card.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL",
                                             "BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR")
+        self.servo_value = self.device_label(lock_card, "MG90S · GPIO 18", self.servo_status)
         self.led_value = self.device_label(led_card, "LED VIRTUAL", "APAGADO")
         self.close_button = ctk.CTkButton(
             lock_card, text="Confirmar cierre", height=29, corner_radius=16,
@@ -456,6 +458,7 @@ class SafeApp(ctk.CTk):
                      "Simulación · sin hardware conectado" if self.mode == "simulacion" else
                      f"Hardware · esperando conexión ({self.backend.port})")
         self.settings_device = self.setting_line(settings_card, 4, "Modo", mode_text)
+        self.settings_servo = self.setting_line(settings_card, 14, "MG90S", self.servo_status)
         self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
         self.threshold_entry = self.setting_input(settings_card, 6, "Umbral SFace", f"{self.similarity_threshold:.3f}")
         self.duration_entry = self.setting_input(settings_card, 7, "Autorización (segundos)", str(self.authorization_seconds))
@@ -467,7 +470,8 @@ class SafeApp(ctk.CTk):
                                              fg_color=SURFACE_2, button_color=BORDER)
         self.mode_choice.set("Simulación" if self.mode == "simulacion" else "Hardware")
         self.mode_choice.grid(row=9, column=0, sticky="ew", padx=24, pady=4)
-        self.port_entry = self.setting_input(settings_card, 10, "Puerto serial (COMx)", self.backend.port or "")
+        self.port_entry = self.setting_input(settings_card, 10, "Puerto serial (COMx)",
+                                             self.backend.port or self.led_port or "")
         actions = ctk.CTkFrame(settings_card, fg_color="transparent")
         actions.grid(row=11, column=0, sticky="w", padx=24, pady=12)
         ctk.CTkButton(actions, text="Guardar ajustes y comprobar conexión", width=265,
@@ -487,6 +491,14 @@ class SafeApp(ctk.CTk):
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=650, justify="left").grid(
             row=13, column=0, sticky="w", padx=24, pady=(0, 14))
+        servo_actions = ctk.CTkFrame(settings_card, fg_color="transparent")
+        servo_actions.grid(row=15, column=0, sticky="w", padx=24, pady=(0, 12))
+        ctk.CTkButton(servo_actions, text="Probar MG90S", width=150, height=36,
+                      corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=lambda: self.require_admin("Calibrar MG90S", self.test_servo)).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(servo_actions, text="Detener PWM", width=140, height=36,
+                      corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=self.stop_servo_signal).pack(side="left")
 
     @staticmethod
     def setting_input(parent, row: int, title: str, value: str) -> ctk.CTkEntry:
@@ -832,8 +844,6 @@ class SafeApp(ctk.CTk):
                 "port": self.port_entry.get().strip().upper(),
             }
             self.settings.validate(values)
-            if self.led_port and values["mode"] != "simulacion":
-                raise ValueError("Con LEDs en GPIO 18/19, conserva la cerradura en simulación")
         except (ValueError, TypeError) as exc:
             self.notify(f"Ajustes inválidos: {exc}", error=True)
             return
@@ -1062,7 +1072,9 @@ class SafeApp(ctk.CTk):
             label = (f"SIM {state}\nFÍSICO DESCONOCIDO" if self.physical_unknown else
                      f"{state} · SOLO SIM")
         else:
-            label = "BLOQUEO ORDENADO" if state == "BLOQUEADA" else state
+            label = ("BLOQUEO ORDENADO\nPOSICIÓN NO VERIFICADA" if state == "BLOQUEADA" else
+                     "APERTURA ORDENADA\nPOSICIÓN NO VERIFICADA" if state == "DESBLOQUEADA" else
+                     "CIERRE PENDIENTE\nPOSICIÓN NO VERIFICADA" if state == "ESPERANDO CIERRE" else state)
         self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
                                   CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
         if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
@@ -1074,6 +1086,31 @@ class SafeApp(ctk.CTk):
 
     def confirm_door_closed(self) -> None:
         self.require_admin("Confirmar cierre", lambda: self.backend.send("confirm_closed"))
+
+    def test_servo(self) -> None:
+        if self.mode != "hardware" or self.servo_status != "NO CONFIGURADO":
+            self.notify("La prueba requiere modo hardware con el servo aún sin calibrar", error=True)
+            return
+        dialog = ctk.CTkInputDialog(
+            title="SAFEBOX AI · Prueba MG90S",
+            text="Servo desacoplado: empieza con 1500 µs; después avanza hasta 50 µs por prueba (1300–1700).")
+        value = dialog.get_input()
+        if value is None:
+            return
+        try:
+            pulse = int(value.strip())
+            if not 1300 <= pulse <= 1700:
+                raise ValueError
+        except ValueError:
+            self.notify("Introduce un pulso entre 1300 y 1700 µs", error=True)
+            return
+        self.backend.send("test_servo", pulse)
+
+    def stop_servo_signal(self) -> None:
+        if self.mode != "hardware" or self.servo_status != "NO CONFIGURADO":
+            self.notify("La parada de prueba solo está disponible antes de calibrar", error=True)
+            return
+        self.backend.send("servo_stop")
 
     def open_registration(self, name: str = "", authorized: bool = False) -> None:
         if not authorized:
@@ -1304,31 +1341,35 @@ class SafeApp(ctk.CTk):
                 mode, port = event[1], event[2]
                 self.mode = mode
                 self.physical_unknown = event[3]
-                badge = ("●  LED ESP32 CONECTADO" if self.led_port and self.led_connected else
+                if mode == "hardware":
+                    self.led_connected = False
+                badge = ("●  HARDWARE CONECTADO" if mode == "hardware" else
+                         "●  LED ESP32 CONECTADO" if self.led_port and self.led_connected else
                          "●  LED ESP32 SIN CONEXIÓN" if self.led_port and self.led_error_seen else
                          "●  LED ESP32 CONECTANDO" if self.led_port else
-                         "●  HARDWARE CONECTADO" if mode == "hardware" else
                          "●  SIM · FÍSICO DESCONOCIDO" if self.physical_unknown else "●  SOLO SIMULACIÓN")
                 self.mode_badge.configure(text=badge,
-                                          text_color=RED if self.led_port and self.led_error_seen else
+                                          text_color=RED if mode == "simulacion" and self.led_port and self.led_error_seen else
                                           AMBER if mode == "simulacion" and self.physical_unknown else CYAN)
-                self.settings_device.configure(text=(self.led_error_message if self.led_error_message else
-                                               f"Cerradura simulada · LEDs {self.led_port} "
-                                               f"{'conectados' if self.led_connected else 'conectando'}") if self.led_port else
-                                               f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
-                                               "Simulación · estado físico desconocido" if self.physical_unknown else
-                                               "Simulación · sin hardware conectado",
-                                               text_color=RED if self.led_port and self.led_error_seen else TEXT)
+                device_text = (f"Hardware · {port} · sin sensor de puerta" if mode == "hardware" else
+                               self.led_error_message or f"Cerradura simulada · LEDs {self.led_port} "
+                               f"{'conectados' if self.led_connected else 'conectando'}" if self.led_port else
+                               "Simulación · estado físico desconocido" if self.physical_unknown else
+                               "Simulación · sin hardware conectado")
+                self.settings_device.configure(text=device_text,
+                                               text_color=RED if mode == "simulacion" and self.led_port and self.led_error_seen else TEXT)
                 if self.pending_settings is not None:
                     values, self.pending_settings = self.pending_settings, None
                     self.commit_settings(values)
             elif kind == "device_error":
                 self.pending_settings = None
                 self.physical_unknown = True
-                self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
+                self.mode_badge.configure(text="●  HARDWARE · ERROR", text_color=RED)
                 self.settings_device.configure(text=event[1], text_color=RED)
                 self.notify(event[1], error=True)
             elif kind == "led_device":
+                if self.mode != "simulacion":
+                    continue
                 self.led_connected = event[1]
                 self.led_error_message = None if event[1] else event[2]
                 self.mode_badge.configure(text=("●  LED ESP32 CONECTADO" if event[1] else
@@ -1342,6 +1383,16 @@ class SafeApp(ctk.CTk):
                 elif not self.led_error_seen:
                     self.notify(event[2], error=True)
                     self.led_error_seen = True
+            elif kind == "servo_status":
+                self.servo_status = event[1].replace("_", " ")
+                color = CYAN if self.servo_status == "LISTO" else RED if self.servo_status == "ERROR" else AMBER
+                self.servo_value.configure(text=self.servo_status, text_color=color)
+                self.settings_servo.configure(text=(self.servo_status +
+                    (" · PWM aceptado, posición física no verificada" if self.servo_status == "LISTO" else
+                     " · configura calibration.h tras probar sin puerta" if self.servo_status == "NO CONFIGURADO" else "")),
+                    text_color=color)
+            elif kind == "servo_test_result":
+                self.notify(event[2], error=not event[1])
             elif kind == "configuration_error":
                 self.pending_settings = None
                 self.notify(event[1], error=True)
