@@ -648,6 +648,7 @@ class SafeBackend:
         enrolling_pin = None
         pin_store = None
         pending_access = None
+        pin_rejected = False
         prompted_id = None
         authorized_id = None
         authorized_track = None
@@ -710,10 +711,11 @@ class SafeBackend:
                 self.events.put(("storage_error", str(exc)))
 
         def end_pending(reason: str) -> None:
-            nonlocal pending_access
+            nonlocal pending_access, pin_rejected
             if pending_access is None:
                 return
             pending_access = None
+            pin_rejected = False
             if self.frame is not None:
                 record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
             self.events.put(("pin_expired", reason))
@@ -837,12 +839,14 @@ class SafeBackend:
                         try:
                             pin_store.verify(person_id, access_pin)
                         except (PermissionError, OSError) as exc:
+                            pin_rejected = True
                             self.events.put(("pin_failed", str(exc)))
                             state("DENEGADO", "PIN de acceso incorrecto")
                             if self.frame is not None:
                                 record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
                             continue
                         pending_access = None
+                        pin_rejected = False
                         if controller.authorize(bridge, publish_lock):
                             authorized_id = person_id
                             authorized_track = last_verified_track
@@ -1056,6 +1060,9 @@ class SafeBackend:
                     (store.users[item.person_id],
                      "AUTORIZADO" if authorized_id == item.person_id and
                      authorized_track == item.track_id else
+                     "DENEGADO" if pin_rejected and pending_access is not None and
+                     pending_access[0] == item.person_id and
+                     pending_access[2] == item.track_id else
                      "PIN PENDIENTE" if pending_access is not None and
                      pending_access[0] == item.person_id and
                      pending_access[2] == item.track_id else
@@ -1114,6 +1121,9 @@ class SafeBackend:
                     else:
                         if prompted_id == (person_id, selected.track_id) and pending_access is None:
                             state("DENEGADO", "Retira el rostro y vuelve a intentar", boxes=boxes)
+                        elif pin_rejected and pending_access is not None:
+                            state("DENEGADO", "PIN de acceso incorrecto; puedes reintentarlo",
+                                  store.users[person_id], similarity, boxes)
                         else:
                             state("PIN REQUERIDO", "Posible coincidencia; introduce el PIN de acceso",
                                   store.users[person_id], similarity, boxes)

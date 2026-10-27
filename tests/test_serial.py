@@ -370,6 +370,7 @@ class SerialTests(unittest.TestCase):
                     backend.send("access_pin", (person_id, "000000", request[3]))
                     until("pin_failed", feed=True)
                     self.assertNotIn("OPEN", instances[0].commands)
+                    self.assertIn("AUTH_FAIL", instances[0].commands)
                     backend.send("access_pin", (person_id, "456789", request[3]))
                     until("pin_success", feed=True)
                     self.assertEqual(instances[0].commands.count("OPEN"), 1)

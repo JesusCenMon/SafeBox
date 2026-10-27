@@ -105,6 +105,11 @@ class AccessTests(unittest.TestCase):
                 self.assertNotIn("OPEN", sent)
                 self.assertNotIn("AUTH_OK", [call.args[0] for call in backend.led_notifier.notify.call_args_list])
                 self.assertIn("AUTH_FAIL", [call.args[0] for call in backend.led_notifier.notify.call_args_list])
+                for _ in range(4):
+                    backend.frame = np.zeros((32, 32, 3), np.uint8)
+                    backend.frame_seq += 1
+                    time.sleep(0.08)
+                self.assertEqual(backend.led_notifier.notify.call_args_list[-1].args[0], "AUTH_FAIL")
                 backend.send("access_pin", (person_id, "456789", request[3]))
                 until("pin_success")
                 self.assertEqual(sent.count("OPEN"), 1)
