@@ -267,7 +267,7 @@ class SafeApp(ctk.CTk):
         self.dashboard_side = side
         self.camera_card = camera_card
         side.grid_columnconfigure(0, weight=1)
-        side.grid_rowconfigure(2, weight=1)
+        side.grid_rowconfigure(3, weight=1)
 
         identity = self.card(side)
         identity.grid(row=0, column=0, sticky="ew", pady=(0, 12))
@@ -315,16 +315,23 @@ class SafeApp(ctk.CTk):
                                             "BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR")
         self.servo_value = self.device_label(lock_card, "MG90S · GPIO 18", self.servo_status)
         self.led_value = self.device_label(led_card, "LED VIRTUAL", "APAGADO")
+        self.lock_action = ctk.CTkFrame(side, fg_color=SURFACE_2, corner_radius=13)
+        self.lock_action.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self.lock_action.grid_columnconfigure(0, weight=1)
+        self.lock_action_label = ctk.CTkLabel(
+            self.lock_action, text="CIERRE PENDIENTE · CONFIRMACIÓN MANUAL",
+            text_color=AMBER, font=ctk.CTkFont("Segoe UI", 10, "bold"), anchor="w")
+        self.lock_action_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
         self.close_button = ctk.CTkButton(
-            lock_card, text="Confirmar cierre", height=29, corner_radius=16,
-            fg_color=SURFACE_2, hover_color=BORDER, text_color=TEXT,
-            font=ctk.CTkFont("Segoe UI", 10, "bold"),
+            self.lock_action, text="Confirmar cierre y preparar MG90S", height=36,
+            corner_radius=18, fg_color=CYAN, hover_color="#1DB954", text_color=BG,
+            font=ctk.CTkFont("Segoe UI", 11, "bold"),
             command=self.confirm_door_closed)
-        self.close_button.pack(fill="x", padx=10, pady=(0, 10))
-        self.close_button.pack_forget()
+        self.close_button.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
+        self.lock_action.grid_remove()
 
         activity = self.card(side)
-        activity.grid(row=2, column=0, sticky="nsew")
+        activity.grid(row=3, column=0, sticky="nsew")
         activity.grid_columnconfigure(0, weight=1)
         activity.grid_rowconfigure(1, weight=1)
         activity_head = ctk.CTkFrame(activity, fg_color="transparent")
@@ -346,7 +353,7 @@ class SafeApp(ctk.CTk):
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             command=self.open_registration,
         )
-        self.register_button.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        self.register_button.grid(row=4, column=0, sticky="ew", pady=(12, 0))
 
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.grid(row=2, column=1, sticky="ew", padx=24, pady=(0, 13))
@@ -1092,9 +1099,12 @@ class SafeApp(ctk.CTk):
         self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
                                   CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
         if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
-            self.close_button.pack(fill="x", padx=10, pady=(0, 10))
+            self.lock_action_label.configure(
+                text="CIERRE PENDIENTE · CONFIRMACIÓN MANUAL" if state == "ESPERANDO CIERRE"
+                else "ACCESO ABIERTO · CONFIRMA EL CIERRE")
+            self.lock_action.grid()
         else:
-            self.close_button.pack_forget()
+            self.lock_action.grid_remove()
         if reason and state in {"ESPERANDO CIERRE", "ERROR"}:
             self.notify(reason, error=state == "ERROR")
 
