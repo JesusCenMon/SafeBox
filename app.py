@@ -1093,16 +1093,16 @@ class SafeApp(ctk.CTk):
             return
         dialog = ctk.CTkInputDialog(
             title="SAFEBOX AI · Prueba MG90S",
-            text="Servo desacoplado: empieza con 1500 µs; después avanza hasta 50 µs por prueba (1300–1700).")
+            text="Servo desacoplado: empieza con 1500 µs; después avanza hasta 50 µs por prueba (1000–2000).")
         value = dialog.get_input()
         if value is None:
             return
         try:
             pulse = int(value.strip())
-            if not 1300 <= pulse <= 1700:
+            if not 1000 <= pulse <= 2000:
                 raise ValueError
         except ValueError:
-            self.notify("Introduce un pulso entre 1300 y 1700 µs", error=True)
+            self.notify("Introduce un pulso entre 1000 y 2000 µs", error=True)
             return
         self.backend.send("test_servo", pulse)
 

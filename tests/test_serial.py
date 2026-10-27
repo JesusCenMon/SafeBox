@@ -165,7 +165,9 @@ class SerialTests(unittest.TestCase):
             bridge.send("AUTH_OK")
             bridge.send("AUTH_FAIL")
             with self.assertRaises(ValueError):
-                bridge.send("TEST_SERVO", pulse_us=1200)
+                bridge.send("TEST_SERVO", pulse_us=900)
+            with self.assertRaises(ValueError):
+                bridge.send("TEST_SERVO", pulse_us=2001)
             bridge.send("TEST_SERVO", pulse_us=1500)
             bridge.send("SERVO_STOP")
             bridge.send("OPEN")

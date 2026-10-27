@@ -362,8 +362,8 @@ class CommandBridge:
         if command not in allowed:
             raise ValueError("Comando no permitido")
         if command == "TEST_SERVO":
-            if not isinstance(pulse_us, int) or not 1300 <= pulse_us <= 1700:
-                raise ValueError("Pulso de prueba: 1300 a 1700 microsegundos")
+            if not isinstance(pulse_us, int) or not 1000 <= pulse_us <= 2000:
+                raise ValueError("Pulso de prueba: 1000 a 2000 microsegundos")
         elif pulse_us is not None:
             raise ValueError("Este comando no acepta un pulso")
         if self.mode in {"hardware", "leds"} and self.serial is None:

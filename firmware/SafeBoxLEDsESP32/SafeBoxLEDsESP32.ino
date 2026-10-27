@@ -14,8 +14,8 @@ constexpr uint32_t LINK_TIMEOUT_MS = 15000;
 constexpr uint32_t TEST_SIGNAL_MS = 600;
 constexpr uint32_t SERVO_PERIOD_US = 20000;  // 50 Hz
 constexpr uint32_t PWM_MAX = 65535;          // 16 bits
-constexpr uint16_t TEST_MIN_US = 1300;
-constexpr uint16_t TEST_MAX_US = 1700;
+constexpr uint16_t TEST_MIN_US = 1000;
+constexpr uint16_t TEST_MAX_US = 2000;
 constexpr uint16_t TEST_FIRST_US = 1500;
 constexpr uint16_t TEST_MAX_STEP_US = 50;
 constexpr bool CALIBRATED = SAFEBOX_OPEN_US != 0 && SAFEBOX_LOCK_US != 0;
