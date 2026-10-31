@@ -99,6 +99,7 @@ class AccessTests(unittest.TestCase):
 
                 request = until("pin_required")
                 self.assertEqual(request[1], person_id)
+                self.assertGreater(request[4], time.monotonic())
                 self.assertNotIn("OPEN", sent)
                 backend.send("access_pin", (person_id, "000000", request[3]))
                 until("pin_failed")
@@ -195,6 +196,15 @@ class AccessTests(unittest.TestCase):
             finally:
                 backend.stop()
                 backend.engine_thread.join(2)
+
+    def test_camera_retry_requests_are_throttled_without_opening_camera(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = core.SafeBackend(Path(directory), "simulacion", None)
+            with patch.object(core.time, "monotonic", side_effect=(100.0, 100.4, 102.0)):
+                self.assertTrue(backend.retry_camera())
+                self.assertFalse(backend.retry_camera())
+                self.assertTrue(backend.retry_camera())
+            self.assertEqual(backend.camera_commands.qsize(), 2)
 
     def test_unknown_face_never_opens(self):
         with tempfile.TemporaryDirectory() as directory:

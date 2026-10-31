@@ -562,6 +562,7 @@ class SafeBackend:
         self.frame: np.ndarray | None = None
         self.frame_seq = 0
         self.camera_connected = False
+        self._last_camera_retry = 0.0
         self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True, name="safebox-camera")
         self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True, name="safebox-engine")
 
@@ -580,8 +581,13 @@ class SafeBackend:
     def send(self, kind: str, value=None) -> None:
         self.commands.put((kind, value))
 
-    def retry_camera(self) -> None:
+    def retry_camera(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_camera_retry < 1.5:
+            return False
+        self._last_camera_retry = now
         self.camera_commands.put("retry")
+        return True
 
     def select_camera(self, index: int) -> None:
         self.camera_commands.put(("switch", index))
@@ -1197,7 +1203,7 @@ class SafeBackend:
                             pending_access = (person_id, now + 15.0, selected.track_id)
                             prompted_id = (person_id, selected.track_id)
                             self.events.put(("pin_required", person_id, store.users[person_id],
-                                             selected.track_id))
+                                             selected.track_id, pending_access[1]))
                 else:
                     detail = "Rostro no registrado" if similarity is not None else "No hay perfiles SFace activos"
                     state("DENEGADO", detail, "Desconocido", similarity, boxes)

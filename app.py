@@ -28,6 +28,8 @@ BG = "#121212"
 SURFACE = "#181818"
 SURFACE_2 = "#252525"
 BORDER = "#383838"
+CARD_BORDER = "#2D352F"
+GREEN_DIM = "#1B3224"
 TEXT = "#FFFFFF"
 MUTED = "#B3B3B3"
 CYAN = "#1ED760"
@@ -107,7 +109,11 @@ class SafeApp(ctk.CTk):
         self.access_window = None
         self.access_request = None
         self.access_track = None
+        self.access_deadline = 0.0
+        self.pin_tick_job = None
         self.history_rows: list[tuple] = []
+        self._rendered_recent = None
+        self._rendered_users = None
         self.history_results: list[tuple] = []
         self.history_offset = 0
         self.current_page = "Inicio"
@@ -129,6 +135,8 @@ class SafeApp(ctk.CTk):
         self.photo_size = None
         self.preview_photo = None
         self.search_job = None
+        self.notice_clear_job = None
+        self.last_notice = ("", 0.0)
 
         self.build_ui()
         self.refresh_history()
@@ -144,6 +152,7 @@ class SafeApp(ctk.CTk):
     def card(parent, radius: int = 16) -> ctk.CTkFrame:
         return ctk.CTkFrame(
             parent, fg_color=SURFACE, corner_radius=radius,
+            border_width=1, border_color=CARD_BORDER,
         )
 
     def build_ui(self) -> None:
@@ -198,7 +207,7 @@ class SafeApp(ctk.CTk):
         self.mode_badge = ctk.CTkLabel(
             header_right, text=f"●  {mode_label}",
             text_color=MUTED if self.mode == "simulacion" else AMBER,
-            fg_color=SURFACE_2, corner_radius=18, width=164, height=34,
+            fg_color=SURFACE_2, corner_radius=18, width=190, height=34,
             font=ctk.CTkFont("Segoe UI", 10, "bold"))
         self.mode_badge.pack(side="left")
 
@@ -273,51 +282,75 @@ class SafeApp(ctk.CTk):
         side.grid_rowconfigure(3, weight=1)
 
         identity = self.card(side)
-        identity.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        self.identity_card = identity
+        identity.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         identity.grid_columnconfigure(0, weight=1)
         self.state_chip = ctk.CTkLabel(
             identity, text="●  ESCANEANDO", text_color=CYAN,
-            fg_color=SURFACE_2, corner_radius=9, width=130, height=30,
+            fg_color=SURFACE_2, corner_radius=9, width=130, height=26,
             font=ctk.CTkFont("Segoe UI", 10, "bold"),
         )
-        self.state_chip.grid(row=0, column=0, sticky="w", padx=18, pady=(18, 12))
+        self.state_chip.grid(row=0, column=0, sticky="w", padx=18, pady=(8, 3))
         self.identity_title = ctk.CTkLabel(
             identity, text="Esperando identidad", text_color=TEXT,
-            font=ctk.CTkFont("Segoe UI", 23, "bold"), anchor="w",
+            font=ctk.CTkFont("Segoe UI", 20, "bold"), anchor="w",
         )
         self.identity_title.grid(row=1, column=0, sticky="ew", padx=18)
         self.detail_label = ctk.CTkLabel(
             identity, text="Sitúate frente a la cámara", text_color=MUTED,
-            font=ctk.CTkFont("Segoe UI", 11), anchor="w",
+            font=ctk.CTkFont("Segoe UI", 10), anchor="w",
         )
-        self.detail_label.grid(row=2, column=0, sticky="ew", padx=18, pady=(2, 14))
+        self.detail_label.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 5))
         metric = ctk.CTkFrame(identity, fg_color=SURFACE_2, corner_radius=10)
-        metric.grid(row=3, column=0, sticky="ew", padx=17, pady=(0, 16))
+        metric.grid(row=3, column=0, sticky="ew", padx=17, pady=(0, 6))
         metric.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(metric, text="SIMILITUD COSENO · SFACE", text_color=MUTED,
                      font=ctk.CTkFont("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, sticky="w", padx=14, pady=(10, 0)
+            row=0, column=0, sticky="w", padx=14, pady=(6, 0)
         )
         self.distance_label = ctk.CTkLabel(metric, text="—", text_color=TEXT,
-                                            font=ctk.CTkFont("Consolas", 21, "bold"))
-        self.distance_label.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
+                                            font=ctk.CTkFont("Consolas", 18, "bold"))
+        self.distance_label.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 6))
         self.threshold_label = ctk.CTkLabel(metric, text=f"UMBRAL  ≥ {self.similarity_threshold:.3f}   ·   MAYOR ES MEJOR",
                      text_color=MUTED, font=ctk.CTkFont("Consolas", 9))
         self.threshold_label.grid(
             row=0, column=1, rowspan=2, sticky="e", padx=14
         )
+        flow = ctk.CTkFrame(identity, fg_color="transparent")
+        flow.grid(row=4, column=0, sticky="ew", padx=17, pady=(0, 6))
+        self.flow_labels = []
+        for index, title in enumerate(("ROSTRO", "PIN", "ACCESO", "PESTILLO", "CIERRE")):
+            flow.grid_columnconfigure(index, weight=1)
+            label = ctk.CTkLabel(flow, text=title, height=20, corner_radius=9,
+                                 fg_color=SURFACE_2, text_color=MUTED,
+                                 font=ctk.CTkFont("Segoe UI", 10, "bold"))
+            label.grid(row=0, column=index, sticky="ew", padx=(0, 4) if index < 4 else 0)
+            self.flow_labels.append(label)
 
         hardware_row = ctk.CTkFrame(side, fg_color="transparent")
-        hardware_row.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        hardware_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         hardware_row.grid_columnconfigure((0, 1), weight=1)
+        hardware_row.grid_rowconfigure(0, weight=1)
         lock_card = self.card(hardware_row, 13)
-        lock_card.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        lock_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         led_card = self.card(hardware_row, 13)
-        led_card.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL",
-                                            "BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR")
-        self.servo_value = self.device_label(lock_card, "MG90S · GPIO 18", self.servo_status)
+        led_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self.lock_icon = ctk.CTkLabel(lock_card, text="▣  PESTILLO", text_color=AMBER,
+                                      font=ctk.CTkFont("Segoe UI", 11, "bold"))
+        self.lock_icon.pack(anchor="w", padx=14, pady=(6, 0))
+        self.lock_value = ctk.CTkLabel(
+            lock_card, text="BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR",
+            text_color=TEXT, font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            wraplength=150, justify="left", anchor="w")
+        self.lock_value.pack(anchor="w", fill="x", padx=14, pady=(0, 0))
+        self.servo_value = ctk.CTkLabel(lock_card, text=f"MG90S · {self.servo_status}",
+                                        text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10),
+                                        anchor="w")
+        self.servo_value.pack(anchor="w", fill="x", padx=14, pady=(0, 6))
         self.led_value = self.device_label(led_card, "SEÑAL LED", "APAGADO")
+        self.led_lamp = ctk.CTkLabel(led_card, text="●", text_color=MUTED,
+                                     font=ctk.CTkFont("Segoe UI", 27))
+        self.led_lamp.pack(anchor="w", padx=14, pady=(0, 11))
         self.lock_action = ctk.CTkFrame(side, fg_color=SURFACE_2, corner_radius=13)
         self.lock_action.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         self.lock_action.grid_columnconfigure(0, weight=1)
@@ -339,7 +372,7 @@ class SafeApp(ctk.CTk):
         activity.grid_columnconfigure(0, weight=1)
         activity.grid_rowconfigure(1, weight=1)
         activity_head = ctk.CTkFrame(activity, fg_color="transparent")
-        activity_head.grid(row=0, column=0, sticky="ew", padx=17, pady=(14, 7))
+        activity_head.grid(row=0, column=0, sticky="ew", padx=17, pady=(8, 4))
         activity_head.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(activity_head, text="ACTIVIDAD RECIENTE", text_color=TEXT,
                      font=ctk.CTkFont("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
@@ -347,6 +380,7 @@ class SafeApp(ctk.CTk):
                      font=ctk.CTkFont("Consolas", 9)).grid(row=0, column=1, sticky="e")
         self.history_list = ctk.CTkScrollableFrame(
             activity, fg_color="transparent", scrollbar_button_color=BORDER,
+            height=58,
         )
         self.history_list.grid(row=1, column=0, sticky="nsew", padx=11, pady=(0, 8))
 
@@ -357,7 +391,7 @@ class SafeApp(ctk.CTk):
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
             command=self.open_registration,
         )
-        self.register_button.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.register_button.grid(row=4, column=0, sticky="ew", pady=(8, 0))
 
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.grid(row=2, column=1, sticky="ew", padx=24, pady=(0, 13))
@@ -371,7 +405,8 @@ class SafeApp(ctk.CTk):
         self.users_count.grid(row=0, column=1, sticky="e")
         self.update_user_count()
         self.notice_label = ctk.CTkLabel(footer, text="", text_color=AMBER,
-                                         font=ctk.CTkFont("Segoe UI", 10))
+                                         font=ctk.CTkFont("Segoe UI", 10),
+                                         wraplength=680, justify="left")
         self.notice_label.grid(row=1, column=0, columnspan=2, sticky="w")
         self.build_secondary_pages()
         self.navigate("Inicio")
@@ -460,24 +495,30 @@ class SafeApp(ctk.CTk):
         settings_card = ctk.CTkScrollableFrame(settings, fg_color=SURFACE, corner_radius=16)
         settings_card.grid(row=2, column=0, sticky="nsew")
         settings_card.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(settings_card, text="Conexiones y datos", text_color=TEXT,
+        ctk.CTkLabel(settings_card, text="Cámara y reconocimiento", text_color=TEXT,
                      font=ctk.CTkFont("Segoe UI", 18, "bold")).grid(
             row=0, column=0, sticky="w", padx=24, pady=(16, 8))
         self.settings_camera = self.setting_line(settings_card, 1, "Cámara", "Iniciando…")
         self.settings_engine = self.setting_line(settings_card, 2, "Reconocimiento", "Iniciando…")
         self.setting_line(settings_card, 3, "Modelo facial", "YuNet + SFace · CPU")
+        ctk.CTkLabel(settings_card, text="ESP32 y acceso", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 17, "bold")).grid(
+            row=7, column=0, sticky="w", padx=24, pady=(18, 8))
         mode_text = (f"Cerradura simulada · LEDs {self.led_port} conectando" if self.led_port else
                      "Simulación · sin hardware conectado" if self.mode == "simulacion" else
                      f"Hardware · esperando conexión ({self.backend.port})")
-        self.settings_device = self.setting_line(settings_card, 4, "Modo", mode_text)
-        self.settings_servo = self.setting_line(settings_card, 14, "MG90S", self.servo_status)
-        self.setting_line(settings_card, 5, "Datos", str(self.backend.data_dir))
-        self.threshold_entry = self.setting_input(settings_card, 6, "Umbral SFace", f"{self.similarity_threshold:.3f}")
-        self.duration_entry = self.setting_input(settings_card, 7, "Autorización (segundos)", str(self.authorization_seconds))
+        self.settings_device = self.setting_line(settings_card, 8, "Modo", mode_text)
+        ctk.CTkLabel(settings_card, text="Pestillo MG90S", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 17, "bold")).grid(
+            row=15, column=0, sticky="w", padx=24, pady=(18, 8))
+        self.settings_servo = self.setting_line(settings_card, 16, "MG90S", self.servo_status)
+        self.setting_line(settings_card, 12, "Datos", str(self.backend.data_dir))
+        self.threshold_entry = self.setting_input(settings_card, 5, "Umbral SFace", f"{self.similarity_threshold:.3f}")
+        self.duration_entry = self.setting_input(settings_card, 11, "Autorización (segundos)", str(self.authorization_seconds))
         self.camera_choice = ctk.CTkOptionMenu(settings_card, values=[f"Cámara {i}" for i in range(10)],
                                                fg_color=SURFACE_2, button_color=BORDER)
         self.camera_choice.set(f"Cámara {self.camera_index}")
-        self.camera_choice.grid(row=8, column=0, sticky="ew", padx=24, pady=4)
+        self.camera_choice.grid(row=4, column=0, sticky="ew", padx=24, pady=4)
         self.mode_choice = ctk.CTkOptionMenu(settings_card, values=["Simulación", "Hardware"],
                                              fg_color=SURFACE_2, button_color=BORDER)
         self.mode_choice.set("Simulación" if self.mode == "simulacion" else "Hardware")
@@ -485,45 +526,52 @@ class SafeApp(ctk.CTk):
         self.port_entry = self.setting_input(settings_card, 10, "Puerto serial (COMx)",
                                              self.backend.port or self.led_port or "")
         actions = ctk.CTkFrame(settings_card, fg_color="transparent")
-        actions.grid(row=11, column=0, sticky="w", padx=24, pady=12)
+        actions.grid(row=13, column=0, sticky="w", padx=24, pady=12)
         ctk.CTkButton(actions, text="Guardar ajustes y comprobar conexión", width=265,
                       height=38, corner_radius=20, fg_color=CYAN, hover_color="#1DB954",
                       text_color=BG, command=self.save_settings).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(actions, text="Cambiar PIN admin", width=145, height=38, corner_radius=20,
-                      fg_color=SURFACE_2, hover_color=BORDER, command=self.change_pin).pack(side="left", padx=4)
-        ctk.CTkButton(actions, text="Cerrar sesión", width=120, height=38, corner_radius=20,
-                      fg_color=SURFACE_2, hover_color=BORDER, command=self.lock_admin_session).pack(side="left", padx=4)
         self.settings_retry = ctk.CTkButton(
             settings_card, text="Reintentar cámara", width=170,
             height=38, corner_radius=20, fg_color=SURFACE_2,
             hover_color=BORDER, text_color=TEXT, command=self.open_camera)
-        self.settings_retry.grid(row=12, column=0, sticky="w", padx=24, pady=(4, 8))
+        self.settings_retry.grid(row=6, column=0, sticky="w", padx=24, pady=(4, 8))
         ctk.CTkLabel(settings_card,
                      text="El modo hardware requiere ESP32 y ACK serial. Confirma el cierre antes de volver a bloquear.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=650, justify="left").grid(
-            row=13, column=0, sticky="w", padx=24, pady=(0, 14))
+            row=14, column=0, sticky="w", padx=24, pady=(0, 14))
         servo_actions = ctk.CTkFrame(settings_card, fg_color="transparent")
-        servo_actions.grid(row=15, column=0, sticky="w", padx=24, pady=(0, 12))
+        servo_actions.grid(row=17, column=0, sticky="w", padx=24, pady=(0, 12))
         ctk.CTkButton(servo_actions, text="Probar MG90S", width=150, height=36,
                       corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
                       command=lambda: self.require_admin("Calibrar MG90S", self.test_servo)).pack(side="left", padx=(0, 8))
         ctk.CTkButton(servo_actions, text="Detener PWM", width=140, height=36,
                       corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
                       command=self.stop_servo_signal).pack(side="left")
-        self.servo_open_entry = self.setting_input(settings_card, 16, "Autorización · µs", "—")
-        self.servo_lock_entry = self.setting_input(settings_card, 17, "Retorno · µs", "—")
+        self.servo_open_entry = self.setting_input(settings_card, 18, "Autorización · µs", "—")
+        self.servo_lock_entry = self.setting_input(settings_card, 19, "Retorno · µs", "—")
         self.servo_save_button = ctk.CTkButton(
             settings_card, text="Guardar recorrido MG90S", width=210, height=36,
             corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
             command=lambda: self.require_admin("Ajustar MG90S", self.save_servo_config))
-        self.servo_save_button.grid(row=18, column=0, sticky="w", padx=24, pady=(6, 4))
+        self.servo_save_button.grid(row=20, column=0, sticky="w", padx=24, pady=(6, 4))
         ctk.CTkLabel(settings_card,
                      text="Solo DEMO · 1000–2000 µs · guardar no mueve el servo."
                           " La posición física no está verificada.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=650, justify="left").grid(
-            row=19, column=0, sticky="w", padx=24, pady=(0, 14))
+            row=21, column=0, sticky="w", padx=24, pady=(0, 14))
+        ctk.CTkLabel(settings_card, text="Administración", text_color=TEXT,
+                     font=ctk.CTkFont("Segoe UI", 17, "bold")).grid(
+            row=22, column=0, sticky="w", padx=24, pady=(18, 8))
+        admin_actions = ctk.CTkFrame(settings_card, fg_color="transparent")
+        admin_actions.grid(row=23, column=0, sticky="w", padx=24, pady=(0, 16))
+        ctk.CTkButton(admin_actions, text="Cambiar PIN admin", width=145, height=38,
+                      corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=self.change_pin).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(admin_actions, text="Cerrar sesión", width=120, height=38,
+                      corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=self.lock_admin_session).pack(side="left")
 
     @staticmethod
     def setting_input(parent, row: int, title: str, value: str) -> ctk.CTkEntry:
@@ -555,8 +603,9 @@ class SafeApp(ctk.CTk):
         self.page_title.configure(text="Panel de control" if page == "Inicio" else page)
         for name, button in self.nav_buttons.items():
             active = name == page
-            button.configure(fg_color=SURFACE_2 if active else "transparent",
-                             text_color=TEXT if active else MUTED)
+            button.configure(fg_color=GREEN_DIM if active else "transparent",
+                             text_color=CYAN if active else MUTED,
+                             hover_color=GREEN_DIM if active else SURFACE_2)
         for frame in self.pages.values():
             frame.grid_remove()
         if page in {"Inicio", "Escáner"}:
@@ -578,6 +627,10 @@ class SafeApp(ctk.CTk):
                 self.request_history()
 
     def refresh_users(self) -> None:
+        fingerprint = (tuple(self.people), frozenset(self.access_pin_ids))
+        if fingerprint == self._rendered_users:
+            return
+        self._rendered_users = fingerprint
         for child in self.users_list.winfo_children():
             child.destroy()
         if not self.people:
@@ -588,32 +641,38 @@ class SafeApp(ctk.CTk):
             return
         for person_id, name, active in self.people:
             item = ctk.CTkFrame(self.users_list, fg_color=SURFACE_2, corner_radius=12)
-            item.pack(fill="x", pady=5)
-            item.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(item, text=f"●  {name}", text_color=TEXT if active else AMBER,
+            item.pack(fill="x", pady=5, padx=2)
+            item.grid_columnconfigure(1, weight=1)
+            initials = "".join(part[0].upper() for part in name.split()[:2]) or "?"
+            ctk.CTkLabel(item, text=initials, width=44, height=44, corner_radius=22,
+                         fg_color=GREEN_DIM if active else BORDER,
+                         text_color=CYAN if active else AMBER,
+                         font=ctk.CTkFont("Segoe UI", 14, "bold")).grid(
+                row=0, column=0, rowspan=2, padx=(14, 10), pady=10)
+            ctk.CTkLabel(item, text=name, text_color=TEXT if active else AMBER,
                          font=ctk.CTkFont("Segoe UI", 13, "bold")).grid(
-                row=0, column=0, sticky="w", padx=18, pady=(9, 0))
+                row=0, column=1, sticky="w", pady=(9, 0))
             pin_text = "PIN de acceso activo" if person_id in self.access_pin_ids else "PIN de acceso pendiente"
             ctk.CTkLabel(item,
                          text=(f"SFace activo · {pin_text}" if active else
                                f"Registro LBPH anterior · requiere nuevo enrolamiento · {pin_text}"),
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
-                row=1, column=0, sticky="w", padx=18, pady=(0, 9))
+                row=1, column=1, sticky="w", pady=(0, 9))
             if not active:
                 ctk.CTkButton(item, text="Reenrolar", width=95, height=32,
                               corner_radius=17, fg_color=CYAN, hover_color="#1DB954",
                               text_color=BG,
                               command=lambda label=name: self.open_registration(label)).grid(
-                    row=0, column=1, rowspan=2, padx=(4, 0))
+                    row=0, column=2, rowspan=2, padx=(4, 0))
             ctk.CTkButton(item, text="PIN acceso", width=95, height=32,
                           corner_radius=17, fg_color=SURFACE, hover_color=BORDER,
                           text_color=TEXT, command=lambda uid=person_id, label=name:
                           self.require_admin("PIN de acceso", lambda: self.set_access_pin(uid, label))).grid(
-                    row=0, column=2, rowspan=2, padx=(4, 0))
+                row=0, column=3, rowspan=2, padx=(4, 0))
             ctk.CTkButton(item, text="Eliminar", width=95, height=32,
                           corner_radius=17, fg_color="#423035", hover_color="#653B44",
                           text_color=RED, command=lambda uid=person_id, label=name:
-                          self.confirm_delete(uid, label)).grid(row=0, column=3, rowspan=2, padx=14)
+                          self.confirm_delete(uid, label)).grid(row=0, column=4, rowspan=2, padx=14)
 
     def confirm_delete(self, person_id: str, name: str, authorized: bool = False) -> None:
         if not authorized:
@@ -646,8 +705,19 @@ class SafeApp(ctk.CTk):
                       command=remove).pack(side="right")
 
     def notify(self, message: str, error: bool = False) -> None:
+        now = time.monotonic()
+        if (message, error) == self.last_notice[0] and now - self.last_notice[1] < 3.0:
+            return
+        self.last_notice = ((message, error), now)
+        if self.notice_clear_job is not None:
+            self.after_cancel(self.notice_clear_job)
         self.notice_label.configure(text=message, text_color=RED if error else CYAN)
-        self.after(5000, lambda: self.notice_label.configure(text="") if self.running else None)
+        self.notice_clear_job = self.after(5000, self.clear_notice)
+
+    def clear_notice(self) -> None:
+        self.notice_clear_job = None
+        if self.running:
+            self.notice_label.configure(text="")
 
     def submit_admin(self, operation, success, error_label, button) -> None:
         def worker() -> None:
@@ -799,7 +869,8 @@ class SafeApp(ctk.CTk):
                       command=save).grid(row=4, column=0, sticky="ew", padx=26, pady=8)
         first.focus_set()
 
-    def show_access_pin(self, person_id: str, name: str, track_id: int) -> None:
+    def show_access_pin(self, person_id: str, name: str, track_id: int,
+                        deadline: float | None = None) -> None:
         if (self.admin_window is not None and self.admin_window.winfo_exists()) or (
                 self.register_window is not None and self.register_window.winfo_exists()):
             self.backend.send("cancel_access")
@@ -813,8 +884,9 @@ class SafeApp(ctk.CTk):
         self.access_window = window
         self.access_request = person_id
         self.access_track = track_id
+        self.access_deadline = deadline if deadline is not None else time.monotonic() + 15.0
         window.title("SAFEBOX AI · Segundo factor")
-        window.geometry("420x245")
+        window.geometry("420x290")
         window.resizable(False, False)
         window.transient(self)
         window.grab_set()
@@ -830,13 +902,35 @@ class SafeApp(ctk.CTk):
         self.access_entry.grid(row=2, column=0, sticky="ew", padx=26, pady=10)
         self.access_error = ctk.CTkLabel(window, text="Tiempo máximo: 15 segundos", text_color=MUTED)
         self.access_error.grid(row=3, column=0, sticky="w", padx=26)
+        self.pin_countdown = ctk.CTkProgressBar(window, height=6,
+                                                progress_color=CYAN, fg_color=SURFACE_2)
+        self.pin_countdown.grid(row=4, column=0, sticky="ew", padx=26, pady=(6, 4))
+        self.pin_countdown_label = ctk.CTkLabel(window, text="", text_color=MUTED,
+                                                font=ctk.CTkFont("Segoe UI", 10))
+        self.pin_countdown_label.grid(row=5, column=0, sticky="w", padx=26)
         self.access_button = ctk.CTkButton(window, text="Verificar y abrir", height=40,
                                            corner_radius=20, fg_color=CYAN,
                                            hover_color="#1DB954", text_color=BG,
                                            command=self.submit_access_pin)
-        self.access_button.grid(row=4, column=0, sticky="ew", padx=26, pady=(6, 10))
+        self.access_button.grid(row=6, column=0, sticky="ew", padx=26, pady=(6, 10))
         self.access_entry.bind("<Return>", lambda _event: self.submit_access_pin())
         self.access_entry.focus_set()
+        self.update_pin_countdown()
+
+    def update_pin_countdown(self) -> None:
+        self.pin_tick_job = None
+        if self.access_window is None or not self.access_window.winfo_exists():
+            return
+        remaining = max(0.0, self.access_deadline - time.monotonic())
+        seconds = int(remaining + 0.999)
+        self.pin_countdown.set(min(1.0, remaining / 15.0))
+        self.pin_countdown_label.configure(
+            text=f"{seconds} s para confirmar el PIN" if seconds else "Tiempo agotado",
+            text_color=AMBER if seconds <= 5 else MUTED)
+        if remaining > 0:
+            self.pin_tick_job = self.after(200, self.update_pin_countdown)
+        else:
+            self.access_button.configure(state="disabled")
 
     def submit_access_pin(self) -> None:
         if self.access_request is None:
@@ -849,6 +943,9 @@ class SafeApp(ctk.CTk):
         self.backend.send("access_pin", (self.access_request, pin, self.access_track))
 
     def close_access_pin(self, cancel: bool = True) -> None:
+        if self.pin_tick_job is not None:
+            self.after_cancel(self.pin_tick_job)
+            self.pin_tick_job = None
         if cancel and self.access_request is not None:
             self.backend.send("cancel_access")
         if self.access_window is not None and self.access_window.winfo_exists():
@@ -858,6 +955,7 @@ class SafeApp(ctk.CTk):
         self.access_window = None
         self.access_request = None
         self.access_track = None
+        self.access_deadline = 0.0
 
     def lock_admin_session(self) -> None:
         self.admin_until = 0.0
@@ -949,26 +1047,29 @@ class SafeApp(ctk.CTk):
             return
         for date, user, result, distance, similarity, capture in rows:
             item = ctk.CTkFrame(self.history_full_list, fg_color=SURFACE_2, corner_radius=12)
-            item.pack(fill="x", pady=4)
-            item.grid_columnconfigure(0, weight=1)
+            item.pack(fill="x", pady=4, padx=2)
+            item.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(item, text="●", text_color=CYAN if result == "AUTORIZADO" else RED,
+                         font=ctk.CTkFont("Segoe UI", 17)).grid(
+                row=0, column=0, rowspan=2, padx=(14, 2), pady=8)
             ctk.CTkLabel(item, text=user, text_color=TEXT,
                          font=ctk.CTkFont("Segoe UI", 12, "bold")).grid(
-                row=0, column=0, sticky="w", padx=16, pady=(9, 0))
+                row=0, column=1, sticky="w", padx=12, pady=(9, 0))
             color = CYAN if result == "AUTORIZADO" else RED
             ctk.CTkLabel(item, text=result, text_color=color,
                          font=ctk.CTkFont("Segoe UI", 11, "bold")).grid(
-                row=0, column=1, sticky="e", padx=12, pady=(9, 0))
+                row=0, column=2, sticky="e", padx=12, pady=(9, 0))
             metric = (f" · SFace coseno {similarity:.3f}" if similarity is not None
                       else f" · LBPH distancia {distance:.1f}" if distance is not None else "")
             ctk.CTkLabel(item, text=date[:19].replace("T", "  ") + metric,
                          text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10)).grid(
-                row=1, column=0, sticky="w", padx=16, pady=(0, 9))
+                row=1, column=1, sticky="w", padx=12, pady=(0, 9))
             if capture:
                 ctk.CTkButton(item, text="Ver captura", width=100, height=27,
                               corner_radius=14, fg_color=BORDER, hover_color="#555555",
                               text_color=TEXT,
                               command=lambda filename=capture: self.show_capture(filename)).grid(
-                    row=1, column=1, padx=12, pady=(0, 8))
+                    row=1, column=2, padx=12, pady=(0, 8))
 
     def show_capture(self, filename: str) -> None:
         path = self.backend.data_dir / "capturas" / filename
@@ -1014,9 +1115,10 @@ class SafeApp(ctk.CTk):
             self.clock_job = self.after(1000, self.update_clock)
 
     def open_camera(self) -> None:
+        if self.camera_connected or not self.backend.retry_camera():
+            return
         self.camera_badge.configure(text="●  CONECTANDO", text_color=BLUE)
         self.retry_button.grid_remove()
-        self.backend.retry_camera()
 
     def on_camera_resize(self, _event=None) -> None:
         canvas = self.camera_canvas
@@ -1054,6 +1156,7 @@ class SafeApp(ctk.CTk):
             return
         color = mix_color(start, target, (step + 1) / 8)
         self.state_chip.configure(text_color=color)
+        self.identity_card.configure(border_color=mix_color(CARD_BORDER, color, 0.55))
         if step < 7:
             self.transition_job = self.after(
                 28, lambda: self.animate_state_color(start, target, step + 1)
@@ -1083,6 +1186,8 @@ class SafeApp(ctk.CTk):
             self.status_color = color
             self.animate_state_color(old, color)
         self.status_state = state
+        self.camera_canvas.itemconfigure(self.scan_text_item,
+                                         text=f"●  {state}" if self.camera_connected else "●  BIOMETRIC SCAN")
         self.state_chip.configure(text=f"●  {state}")
         title = user if state in {"AUTORIZADO", "DENEGADO", "REGISTRANDO"} and user != "—" else {
             "INICIANDO": "Iniciando sistema",
@@ -1102,7 +1207,27 @@ class SafeApp(ctk.CTk):
         if similarity is not None:
             scan_text += f" · coseno {similarity:.3f}"
         self.scan_result.configure(text=scan_text, text_color=color)
+        self.refresh_flow()
         self.refresh_led_indicator()
+
+    def refresh_flow(self) -> None:
+        if self.lock_state == "ESPERANDO CIERRE":
+            current = 4
+        elif self.lock_state == "DESBLOQUEADA":
+            current = 3
+        elif self.status_state == "AUTORIZADO":
+            current = 2
+        elif self.status_state == "PIN REQUERIDO":
+            current = 1
+        else:
+            current = 0
+        for index, label in enumerate(self.flow_labels):
+            active = index == current
+            completed = index < current
+            color = RED if active and self.status_state == "DENEGADO" else (
+                AMBER if active and current == 4 else CYAN if active or completed else MUTED)
+            label.configure(text_color=color,
+                            fg_color=GREEN_DIM if completed else SURFACE_2)
 
     def finish_blue_led_indicator(self) -> None:
         self.led_off_job = None
@@ -1119,6 +1244,7 @@ class SafeApp(ctk.CTk):
         else:
             led, color = "APAGADO", MUTED
         self.led_value.configure(text=led, text_color=color)
+        self.led_lamp.configure(text_color=color)
 
     def update_lock(self, state: str, reason: str) -> None:
         self.lock_state = state
@@ -1131,6 +1257,13 @@ class SafeApp(ctk.CTk):
                      "CIERRE PENDIENTE\nPOSICIÓN NO VERIFICADA" if state == "ESPERANDO CIERRE" else state)
         self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
                                   CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
+        lock_symbol = "▣  PESTILLO" if state == "BLOQUEADA" else (
+            "▢  LIBERACIÓN ORDENADA" if state == "DESBLOQUEADA" else
+            "◇  CIERRE PENDIENTE" if state == "ESPERANDO CIERRE" else
+            "◇  ESTADO DESCONOCIDO" if state == "ERROR" else "◇  VERIFICANDO")
+        self.lock_icon.configure(text=lock_symbol,
+                                 text_color=RED if state == "ERROR" else
+                                 CYAN if state == "DESBLOQUEADA" else AMBER)
         if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
             self.lock_action_label.configure(
                 text="CIERRA LA PUERTA MANUALMENTE Y CONFIRMA" if state == "ESPERANDO CIERRE"
@@ -1147,6 +1280,7 @@ class SafeApp(ctk.CTk):
         else:
             self.lock_action.grid_remove()
         self.refresh_led_indicator()
+        self.refresh_flow()
         notice = (state, reason) if reason and state in {"ESPERANDO CIERRE", "ERROR"} else None
         if notice is not None and notice != self.last_lock_notice:
             self.notify(reason, error=state == "ERROR")
@@ -1204,10 +1338,13 @@ class SafeApp(ctk.CTk):
         if self.register_window is not None and self.register_window.winfo_exists():
             self.register_window.focus()
             return
+        if self.modal_close_job is not None:
+            self.after_cancel(self.modal_close_job)
+            self.modal_close_job = None
         window = ctk.CTkToplevel(self, fg_color=BG)
         self.register_window = window
         window.title("SAFEBOX AI · Nuevo usuario")
-        window.geometry("440x420")
+        window.geometry("460x440")
         window.resizable(False, False)
         window.transient(self)
         window.grab_set()
@@ -1217,7 +1354,7 @@ class SafeApp(ctk.CTk):
                      font=ctk.CTkFont("Segoe UI", 23, "bold")).grid(
             row=0, column=0, sticky="w", padx=28, pady=(25, 5)
         )
-        ctk.CTkLabel(window, text="Mantén una sola persona frente a la cámara durante la captura.",
+        ctk.CTkLabel(window, text="Nombre y PIN · un rostro frente a la cámara · 20 muestras de captura.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=375, justify="left").grid(
             row=1, column=0, sticky="w", padx=28
@@ -1237,12 +1374,12 @@ class SafeApp(ctk.CTk):
                                                   show="•", height=40, corner_radius=20)
         self.register_pin_confirm.grid(row=4, column=0, sticky="ew", padx=28, pady=(0, 12))
         self.enrollment_progress = ctk.CTkProgressBar(
-            window, height=7, progress_color=CYAN, fg_color=SURFACE_2,
+            window, height=9, progress_color=CYAN, fg_color=SURFACE_2,
         )
         self.enrollment_progress.grid(row=5, column=0, sticky="ew", padx=28)
         self.enrollment_progress.set(0)
         self.enrollment_hint = ctk.CTkLabel(
-            window, text="0 / 20 muestras", text_color=MUTED,
+            window, text=f"0 / {SAMPLES_REQUIRED} muestras · esperando captura", text_color=MUTED,
             font=ctk.CTkFont("Consolas", 11),
         )
         self.enrollment_hint.grid(row=6, column=0, sticky="w", padx=28, pady=(8, 18))
@@ -1293,6 +1430,9 @@ class SafeApp(ctk.CTk):
         self.backend.send("start_enroll", (name, access_pin))
 
     def cancel_enrollment(self) -> None:
+        if self.modal_close_job is not None:
+            self.after_cancel(self.modal_close_job)
+            self.modal_close_job = None
         self.backend.send("cancel_enroll")
         if self.register_window is not None and self.register_window.winfo_exists():
             self.register_pin.configure(state="normal")
@@ -1315,14 +1455,18 @@ class SafeApp(ctk.CTk):
         self.register_window = None
 
     def refresh_history(self) -> None:
+        fingerprint = tuple(self.history_rows)
+        if fingerprint == self._rendered_recent:
+            return
+        self._rendered_recent = fingerprint
         for child in self.history_list.winfo_children():
             child.destroy()
         rows = self.history_rows
         if not rows:
             ctk.CTkLabel(
                 self.history_list, text="Aún no hay intentos registrados.",
-                text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
-            ).pack(anchor="w", padx=8, pady=12)
+                text_color=MUTED, font=ctk.CTkFont("Segoe UI", 10),
+            ).pack(anchor="w", padx=8, pady=(2, 0))
             return
         for date, user, result, distance, similarity in rows:
             item = ctk.CTkFrame(self.history_list, fg_color=SURFACE_2, corner_radius=8)
@@ -1385,13 +1529,15 @@ class SafeApp(ctk.CTk):
                 if self.camera_connected:
                     self.camera_badge.configure(text="●  EN VIVO", text_color=CYAN)
                     self.settings_camera.configure(text="Conectada", text_color=CYAN)
+                    self.settings_retry.configure(state="disabled")
                     self.retry_button.grid_remove()
                     self.camera_canvas.delete("placeholder")
                     if self.backend_ready:
                         self.set_state("ESCANEANDO", "Esperando un rostro frente a la cámara")
                 else:
                     self.camera_badge.configure(text="●  SIN SEÑAL", text_color=AMBER)
-                    self.settings_camera.configure(text="Desconectada", text_color=AMBER)
+                    self.settings_camera.configure(text=f"Desconectada · {event[2]}", text_color=AMBER)
+                    self.settings_retry.configure(state="normal")
                     self.retry_button.grid()
                     self.camera_canvas.itemconfigure(self.image_item, image="")
                     self.photo = None
@@ -1470,7 +1616,7 @@ class SafeApp(ctk.CTk):
             elif kind == "servo_status":
                 self.servo_status = event[1].replace("_", " ")
                 color = CYAN if self.servo_status == "LISTO" else RED if self.servo_status == "ERROR" else AMBER
-                self.servo_value.configure(text=self.servo_status, text_color=color)
+                self.servo_value.configure(text=f"MG90S · {self.servo_status}", text_color=color)
                 self.settings_servo.configure(text=(self.servo_status +
                     (" · PWM aceptado, posición física no verificada" if self.servo_status == "LISTO" else
                      " · modo DEMO; posición física no verificada" if self.servo_status == "DEMO" else
@@ -1510,12 +1656,14 @@ class SafeApp(ctk.CTk):
             elif kind == "pin_set":
                 self.notify(f"PIN de acceso guardado para {event[1]}")
             elif kind == "pin_required":
-                self.show_access_pin(event[1], event[2], event[3])
+                self.show_access_pin(event[1], event[2], event[3],
+                                     event[4] if len(event) > 4 else None)
             elif kind == "pin_failed":
                 if self.access_window is not None and self.access_window.winfo_exists():
                     self.access_entry.delete(0, "end")
                     self.access_error.configure(text=event[1], text_color=RED)
-                    self.access_button.configure(state="normal")
+                    self.access_button.configure(
+                        state="normal" if time.monotonic() < self.access_deadline else "disabled")
             elif kind == "pin_expired":
                 self.close_access_pin(False)
                 self.notify(event[1], error=True)
@@ -1539,7 +1687,8 @@ class SafeApp(ctk.CTk):
             elif kind == "enroll_progress":
                 if self.register_window is not None and self.register_window.winfo_exists():
                     self.enrollment_progress.set(event[1] / SAMPLES_REQUIRED)
-                    label = "Guardando perfil SFace…" if event[1] >= SAMPLES_REQUIRED else f"{event[1]} / {SAMPLES_REQUIRED} muestras"
+                    label = ("Guardando perfil SFace…" if event[1] >= SAMPLES_REQUIRED else
+                             f"{event[1]} / {SAMPLES_REQUIRED} muestras · {round(event[1] / SAMPLES_REQUIRED * 100)} %")
                     self.enrollment_hint.configure(text=label)
             elif kind == "enroll_done":
                 self.known_users = event[2]
@@ -1687,7 +1836,7 @@ class SafeApp(ctk.CTk):
         self.running = False
         self.admin_until = 0.0
         for job in (self.transition_job, self.led_off_job, self.backend_start_job, self.poll_job,
-                    self.clock_job, self.modal_close_job, self.search_job):
+                    self.clock_job, self.modal_close_job, self.search_job, self.notice_clear_job):
             if job is not None:
                 self.after_cancel(job)
         if self.register_window is not None and self.register_window.winfo_exists():
