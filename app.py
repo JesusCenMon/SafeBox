@@ -116,6 +116,9 @@ class SafeApp(ctk.CTk):
         self.last_frame_seq = 0
         self.status_state = ""
         self.status_color = CYAN
+        self.blue_led_until = 0.0
+        self.led_off_job = None
+        self.last_lock_notice = None
         self.transition_job = None
         self.backend_start_job = None
         self.poll_job = None
@@ -314,13 +317,14 @@ class SafeApp(ctk.CTk):
         self.lock_value = self.device_label(lock_card, "CERRADURA VIRTUAL",
                                             "BLOQUEADA · SOLO SIM" if self.mode == "simulacion" else "SIN CONFIRMAR")
         self.servo_value = self.device_label(lock_card, "MG90S · GPIO 18", self.servo_status)
-        self.led_value = self.device_label(led_card, "LED VIRTUAL", "APAGADO")
+        self.led_value = self.device_label(led_card, "SEÑAL LED", "APAGADO")
         self.lock_action = ctk.CTkFrame(side, fg_color=SURFACE_2, corner_radius=13)
         self.lock_action.grid(row=2, column=0, sticky="ew", pady=(0, 12))
         self.lock_action.grid_columnconfigure(0, weight=1)
         self.lock_action_label = ctk.CTkLabel(
             self.lock_action, text="CIERRE PENDIENTE · CONFIRMACIÓN MANUAL",
-            text_color=AMBER, font=ctk.CTkFont("Segoe UI", 10, "bold"), anchor="w")
+            text_color=AMBER, font=ctk.CTkFont("Segoe UI", 10, "bold"),
+            anchor="w", justify="left", wraplength=320)
         self.lock_action_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 4))
         self.close_button = ctk.CTkButton(
             self.lock_action, text="Confirmar cierre y preparar MG90S", height=36,
@@ -515,8 +519,8 @@ class SafeApp(ctk.CTk):
             command=lambda: self.require_admin("Ajustar MG90S", self.save_servo_config))
         self.servo_save_button.grid(row=18, column=0, sticky="w", padx=24, pady=(6, 4))
         ctk.CTkLabel(settings_card,
-                     text="Solo DEMO sin puerta · 1000–2000 µs · guardar no mueve el servo."
-                          " Mide otras posiciones antes de instalar el pestillo real.",
+                     text="Solo DEMO · 1000–2000 µs · guardar no mueve el servo."
+                          " La posición física no está verificada.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=650, justify="left").grid(
             row=19, column=0, sticky="w", padx=24, pady=(0, 14))
@@ -800,6 +804,10 @@ class SafeApp(ctk.CTk):
                 self.register_window is not None and self.register_window.winfo_exists()):
             self.backend.send("cancel_access")
             return
+        if (self.access_window is not None and self.access_window.winfo_exists() and
+                self.access_request == person_id and self.access_track == track_id):
+            self.access_window.focus()
+            return
         self.close_access_pin(False)
         window = ctk.CTkToplevel(self, fg_color=BG)
         self.access_window = window
@@ -1057,6 +1065,16 @@ class SafeApp(ctk.CTk):
         self, state: str, detail: str, user: str = "—", similarity: float | None = None
     ) -> None:
         color = STATE_COLORS[state]
+        if state == "AUTORIZADO" and self.status_state != "AUTORIZADO":
+            self.blue_led_until = time.monotonic() + 3.0
+            if self.led_off_job is not None:
+                self.after_cancel(self.led_off_job)
+            self.led_off_job = self.after(3000, self.finish_blue_led_indicator)
+        elif state == "DENEGADO":
+            self.blue_led_until = 0.0
+            if self.led_off_job is not None:
+                self.after_cancel(self.led_off_job)
+                self.led_off_job = None
         if state != self.status_state:
             if self.transition_job is not None:
                 self.after_cancel(self.transition_job)
@@ -1084,8 +1102,23 @@ class SafeApp(ctk.CTk):
         if similarity is not None:
             scan_text += f" · coseno {similarity:.3f}"
         self.scan_result.configure(text=scan_text, text_color=color)
-        led = "AZUL" if self.lock_state in {"DESBLOQUEADA", "ESPERANDO CIERRE"} else "ROJO" if state == "DENEGADO" else "APAGADO"
-        self.led_value.configure(text=led, text_color=BLUE if led == "AZUL" else RED if led == "ROJO" else MUTED)
+        self.refresh_led_indicator()
+
+    def finish_blue_led_indicator(self) -> None:
+        self.led_off_job = None
+        self.blue_led_until = 0.0
+        self.refresh_led_indicator()
+
+    def refresh_led_indicator(self) -> None:
+        if self.mode == "hardware" and self.lock_state == "ERROR":
+            led, color = "ESTADO DESCONOCIDO", AMBER
+        elif self.status_state == "DENEGADO":
+            led, color = "ROJO · ORDENADO", RED
+        elif time.monotonic() < self.blue_led_until:
+            led, color = "AZUL · 3 s", BLUE
+        else:
+            led, color = "APAGADO", MUTED
+        self.led_value.configure(text=led, text_color=color)
 
     def update_lock(self, state: str, reason: str) -> None:
         self.lock_state = state
@@ -1094,19 +1127,30 @@ class SafeApp(ctk.CTk):
                      f"{state} · SOLO SIM")
         else:
             label = ("BLOQUEO ORDENADO\nPOSICIÓN NO VERIFICADA" if state == "BLOQUEADA" else
-                     "APERTURA ORDENADA\nPOSICIÓN NO VERIFICADA" if state == "DESBLOQUEADA" else
+                     "LIBERACIÓN ORDENADA\nPOSICIÓN NO VERIFICADA" if state == "DESBLOQUEADA" else
                      "CIERRE PENDIENTE\nPOSICIÓN NO VERIFICADA" if state == "ESPERANDO CIERRE" else state)
         self.lock_value.configure(text=label, text_color=RED if state == "ERROR" else
                                   CYAN if state == "DESBLOQUEADA" else AMBER if state in {"ESPERANDO CIERRE", "AUTORIZACIÓN PENDIENTE"} else TEXT)
         if state in {"DESBLOQUEADA", "ESPERANDO CIERRE"}:
             self.lock_action_label.configure(
-                text="CIERRE PENDIENTE · CONFIRMACIÓN MANUAL" if state == "ESPERANDO CIERRE"
-                else "ACCESO ABIERTO · CONFIRMA EL CIERRE")
+                text="CIERRA LA PUERTA MANUALMENTE Y CONFIRMA" if state == "ESPERANDO CIERRE"
+                else "DESLIZA LA PUERTA; CIÉRRALA ANTES DE CONFIRMAR",
+                text_color=AMBER)
+            self.close_button.grid()
+            self.lock_action.grid()
+        elif self.mode == "hardware" and state == "ERROR":
+            self.lock_action_label.configure(
+                text="ESTADO FÍSICO DESCONOCIDO · REVISA COM Y MG90S EN CONFIGURACIÓN",
+                text_color=RED)
+            self.close_button.grid_remove()
             self.lock_action.grid()
         else:
             self.lock_action.grid_remove()
-        if reason and state in {"ESPERANDO CIERRE", "ERROR"}:
+        self.refresh_led_indicator()
+        notice = (state, reason) if reason and state in {"ESPERANDO CIERRE", "ERROR"} else None
+        if notice is not None and notice != self.last_lock_notice:
             self.notify(reason, error=state == "ERROR")
+        self.last_lock_notice = notice
 
     def confirm_door_closed(self) -> None:
         self.require_admin("Confirmar cierre", lambda: self.backend.send("confirm_closed"))
@@ -1429,8 +1473,8 @@ class SafeApp(ctk.CTk):
                 self.servo_value.configure(text=self.servo_status, text_color=color)
                 self.settings_servo.configure(text=(self.servo_status +
                     (" · PWM aceptado, posición física no verificada" if self.servo_status == "LISTO" else
-                     " · demostración sin puerta; pestillo no calibrado" if self.servo_status == "DEMO" else
-                     " · configura calibration.h tras probar sin puerta" if self.servo_status == "NO CONFIGURADO" else "")),
+                     " · modo DEMO; posición física no verificada" if self.servo_status == "DEMO" else
+                     " · calibra el pestillo desacoplado antes de usarlo" if self.servo_status == "NO CONFIGURADO" else "")),
                     text_color=color)
             elif kind == "servo_config":
                 self.servo_pulses = (event[1], event[2])
@@ -1642,7 +1686,7 @@ class SafeApp(ctk.CTk):
             return
         self.running = False
         self.admin_until = 0.0
-        for job in (self.transition_job, self.backend_start_job, self.poll_job,
+        for job in (self.transition_job, self.led_off_job, self.backend_start_job, self.poll_job,
                     self.clock_job, self.modal_close_job, self.search_job):
             if job is not None:
                 self.after_cancel(job)

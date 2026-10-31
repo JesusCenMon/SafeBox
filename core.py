@@ -665,6 +665,7 @@ class SafeBackend:
         controller = LockController(self.authorization_seconds, ready=self.mode == "simulacion")
         last_state: tuple | None = None
         last_led_command = "LED_OFF"
+        blue_led_until = 0.0
         last_seq = 0
         last_analyze = 0.0
         last_face_seen = 0.0
@@ -692,9 +693,11 @@ class SafeBackend:
 
         def state(name: str, detail: str, user: str = "—", similarity: float | None = None,
                   boxes: list[tuple[int, int, int, int]] | None = None) -> None:
-            nonlocal last_state, last_led_command
+            nonlocal last_state, last_led_command, blue_led_until
             led_command = ("AUTH_FAIL" if name == "DENEGADO" else
                            "AUTH_OK" if name == "AUTORIZADO" else "LED_OFF")
+            if led_command == "LED_OFF" and time.monotonic() < blue_led_until:
+                led_command = "AUTH_OK"
             if led_command != last_led_command:
                 if self.mode == "hardware" and bridge is not None and bridge.serial is not None:
                     try:
@@ -705,6 +708,10 @@ class SafeBackend:
                 elif self.led_notifier is not None:
                     self.led_notifier.notify(led_command)
                 last_led_command = led_command
+                if led_command == "AUTH_OK":
+                    blue_led_until = time.monotonic() + 3.0
+                elif led_command == "AUTH_FAIL":
+                    blue_led_until = 0.0
             visible_boxes = (boxes if boxes is not None else
                              [item.box for item in tracker.previous]
                              if name in {"AUTORIZADO", "DENEGADO", "PIN REQUERIDO"} else [])
@@ -743,9 +750,10 @@ class SafeBackend:
             nonlocal pending_access, pin_rejected
             if pending_access is None:
                 return
+            already_denied = pin_rejected
             pending_access = None
             pin_rejected = False
-            if self.frame is not None:
+            if not already_denied and self.frame is not None:
                 record_attempt("Desconocido", "DENEGADO", last_verified_similarity, self.frame)
             self.events.put(("pin_expired", reason))
 
@@ -760,7 +768,7 @@ class SafeBackend:
                     self.servo_status = bridge.servo_status or "ERROR"
                     if self.servo_status in {"LISTO", "DEMO"}:
                         controller.state = LockController.WAITING_CLOSE
-                        controller.reason = ("Demo MG90S sin puerta; confirma el retorno al centro" if
+                        controller.reason = ("MG90S en DEMO; confirma el cierre manual antes de bloquear" if
                                              self.servo_status == "DEMO" else
                                              "Servo listo; confirma el cierre antes de bloquear")
                     else:
@@ -886,7 +894,8 @@ class SafeBackend:
                             name = store.users[person_id]
                             face_labels = [(name, "AUTORIZADO") if item.track_id == authorized_track
                                            else label for item, label in zip(tracker.previous, face_labels)]
-                            state("AUTORIZADO", "Rostro y PIN verificados", name, last_verified_similarity)
+                            state("AUTORIZADO", "Liberación ordenada; desliza la puerta manualmente",
+                                  name, last_verified_similarity)
                             if self.frame is not None:
                                 record_attempt(name, "AUTORIZADO", last_verified_similarity, self.frame)
                             self.events.put(("pin_success", name))
@@ -986,13 +995,14 @@ class SafeBackend:
                                         self.led_notifier.start()
                                 elif self.servo_status in {"LISTO", "DEMO"}:
                                     controller.state = LockController.WAITING_CLOSE
-                                    controller.reason = ("Demo MG90S sin puerta; confirma el retorno al centro" if
+                                    controller.reason = ("MG90S en DEMO; confirma el cierre manual antes de bloquear" if
                                                          self.servo_status == "DEMO" else
                                                          "Servo listo; confirma el cierre antes de bloquear")
                                 else:
                                     controller.fail("Servo sin calibrar" if self.servo_status == "NO_CONFIGURADO"
                                                     else "No se pudo inicializar PWM del servo")
                                 last_led_command = "LED_OFF"
+                                blue_led_until = 0.0
                                 next_ping = time.monotonic() + self.HEARTBEAT_INTERVAL
                                 device_error_reported = False
                                 self.events.put(("device", new_mode, new_port, self.physical_unknown))
@@ -1161,7 +1171,8 @@ class SafeBackend:
                     last_verified_at = now
                     last_verified_similarity = similarity
                     if authorized_id == person_id and authorized_track == selected.track_id:
-                        state("AUTORIZADO", "Rostro y PIN verificados", store.users[person_id], similarity, boxes)
+                        state("AUTORIZADO", "Liberación ordenada; desliza la puerta manualmente",
+                              store.users[person_id], similarity, boxes)
                     elif not self.admin_ready or not pin_store.has_pin(person_id):
                         detail = ("Configura el PIN de administrador" if not self.admin_ready else
                                   "Esta identidad necesita un PIN de acceso")

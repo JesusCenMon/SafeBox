@@ -122,6 +122,77 @@ class AccessTests(unittest.TestCase):
                     time.sleep(0.02)
                 self.assertEqual(sent.count("LOCK"), 1)
                 self.assertEqual(sent.count("OPEN"), 1)
+                backend.camera_connected = False
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        event = backend.events.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if event[0] == "state" and event[1] == "CÁMARA DESCONECTADA":
+                        break
+                else:
+                    self.fail("No se notificó la desconexión de cámara")
+                self.assertEqual(backend.led_notifier.notify.call_args_list[-1].args[0], "AUTH_OK")
+                deadline = time.monotonic() + 4
+                while (time.monotonic() < deadline and
+                       backend.led_notifier.notify.call_args_list[-1].args[0] != "LED_OFF"):
+                    time.sleep(0.05)
+                self.assertEqual(backend.led_notifier.notify.call_args_list[-1].args[0], "LED_OFF")
+                backend.stop()
+                backend.engine_thread.join(2)
+
+    def test_wrong_pin_then_cancel_records_one_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            feature = np.eye(1, 128, 0, dtype=np.float32).reshape(-1)
+            person_id = core.FaceStore(root).add_person("Ana", [feature] * core.ENROLL_SAMPLES)
+            AccessPinStore(root).set_pin(person_id, "456789")
+            history = Mock()
+            backend = core.SafeBackend(root, "simulacion", None, 0.5)
+            backend.camera_connected = True
+
+            class Bridge:
+                def __init__(self, *_args):
+                    pass
+
+                def send(self, _command):
+                    pass
+
+                def close(self):
+                    pass
+
+            def until(kind):
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    backend.frame = np.zeros((32, 32, 3), np.uint8)
+                    backend.frame_seq += 1
+                    try:
+                        event = backend.events.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if event[0] == "engine_error":
+                        self.fail(event[1])
+                    if event[0] == kind:
+                        return event
+                self.fail(f"No llegó {kind}")
+
+            try:
+                with (patch.object(core, "load_models", return_value=(object(), object())),
+                      patch.object(core, "detect_faces", return_value=FACE),
+                      patch.object(core, "extract_feature", return_value=feature),
+                      patch.object(core, "CommandBridge", Bridge),
+                      patch.object(core, "AccessHistory", return_value=history)):
+                    backend.engine_thread.start()
+                    backend.send("admin_ready", True)
+                    request = until("pin_required")
+                    backend.send("access_pin", (person_id, "000000", request[3]))
+                    until("pin_failed")
+                    backend.send("cancel_access")
+                    until("pin_expired")
+                    self.assertEqual(history.record.call_count, 1)
+                    self.assertEqual(history.record.call_args.args[1], "DENEGADO")
+            finally:
                 backend.stop()
                 backend.engine_thread.join(2)
 
