@@ -1138,7 +1138,7 @@ class SafeApp(ctk.CTk):
 
     def save_servo_config(self) -> None:
         if self.mode != "hardware" or self.servo_status != "DEMO":
-            self.notify("Conecta COM4 en modo hardware DEMO antes de ajustar el MG90S", error=True)
+            self.notify(f"Conecta {self.backend.port} en modo hardware DEMO antes de ajustar el MG90S", error=True)
             return
         try:
             pulses = (int(self.servo_open_entry.get().strip()),
@@ -1684,7 +1684,7 @@ def main() -> None:
     parser.add_argument("--self-test", action="store_true", help="verifica software sin cámara")
     parser.add_argument("--data-dir", type=Path, default=BASE / "datos")
     parser.add_argument("--mode", choices=("simulacion", "hardware"))
-    parser.add_argument("--port", help="puerto de la WeMos (predeterminado: COM4 en hardware)")
+    parser.add_argument("--port", help="puerto de la WeMos (usa el guardado o COM4 por defecto)")
     parser.add_argument("--led-port", help="puerto LED en simulación; usa COMx u OFF")
     parser.add_argument("--similarity-threshold", type=float,
                         help="umbral coseno SFace entre 0.5 y 0.9 (predeterminado: 0.5)")
@@ -1703,7 +1703,7 @@ def main() -> None:
         values = dict(settings.values)
         values["mode"] = args.mode if args.mode is not None else "hardware"
         if values["mode"] == "hardware":
-            values["port"] = args.port if args.port is not None else "COM4"
+            values["port"] = args.port if args.port is not None else (values["port"] or "COM4")
         for key, supplied in (("mode", args.mode), ("port", args.port),
                               ("similarity_threshold", args.similarity_threshold),
                               ("camera_index", args.camera_index),
