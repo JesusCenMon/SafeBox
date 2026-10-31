@@ -7,7 +7,7 @@ import queue
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import Canvas, filedialog
 
@@ -86,6 +86,7 @@ class SafeApp(ctk.CTk):
         self.pending_settings = None
         self.led_port = led_port
         self.led_connected = False
+        self.device_connected = False
         self.led_error_seen = False
         self.led_error_message: str | None = None
         self.servo_status = "NO CONECTADO"
@@ -137,6 +138,10 @@ class SafeApp(ctk.CTk):
         self.search_job = None
         self.notice_clear_job = None
         self.last_notice = ("", 0.0)
+        self.presentation_mode = False
+        self.daily_rows: list[tuple[str, int, int]] = []
+        self.history_dates = (None, None)
+        self.resize_job = None
 
         self.build_ui()
         self.refresh_history()
@@ -145,6 +150,7 @@ class SafeApp(ctk.CTk):
         self.backend_start_job = self.after(20, self.backend.start)
         self.poll_job = self.after(40, self.poll_backend)
         self.clock_job = self.after(1000, self.update_clock)
+        self.bind("<Configure>", self.schedule_responsive_layout)
         if not self.admin.configured:
             self.after(100, self.prompt_create_pin)
 
@@ -160,6 +166,7 @@ class SafeApp(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         navigation = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0, width=210)
+        self.navigation = navigation
         navigation.grid(row=0, column=0, rowspan=3, sticky="nsew")
         navigation.grid_propagate(False)
         ctk.CTkLabel(navigation, text="◈  SAFEBOX AI", text_color=TEXT,
@@ -210,6 +217,11 @@ class SafeApp(ctk.CTk):
             fg_color=SURFACE_2, corner_radius=18, width=190, height=34,
             font=ctk.CTkFont("Segoe UI", 10, "bold"))
         self.mode_badge.pack(side="left")
+        self.presentation_button = ctk.CTkButton(
+            header_right, text="◩  Presentación", width=128, height=34,
+            corner_radius=18, fg_color=SURFACE_2, hover_color=BORDER,
+            text_color=TEXT, command=self.toggle_presentation)
+        self.presentation_button.pack(side="left", padx=(12, 0))
 
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.grid(row=1, column=1, sticky="nsew", padx=24, pady=(0, 14))
@@ -368,6 +380,7 @@ class SafeApp(ctk.CTk):
         self.lock_action.grid_remove()
 
         activity = self.card(side)
+        self.activity_card = activity
         activity.grid(row=3, column=0, sticky="nsew")
         activity.grid_columnconfigure(0, weight=1)
         activity.grid_rowconfigure(1, weight=1)
@@ -452,7 +465,7 @@ class SafeApp(ctk.CTk):
         filters = self.card(history)
         filters.grid(row=2, column=0, sticky="nsew")
         filters.grid_columnconfigure(0, weight=1)
-        filters.grid_rowconfigure(3, weight=1)
+        filters.grid_rowconfigure(5, weight=1)
         self.stats_label = ctk.CTkLabel(
             filters, text="Cargando estadísticas…", text_color=TEXT,
             font=ctk.CTkFont("Segoe UI", 12, "bold"))
@@ -474,14 +487,30 @@ class SafeApp(ctk.CTk):
         ctk.CTkButton(search_row, text="Exportar CSV", width=115, height=40,
                       corner_radius=20, fg_color=BORDER, hover_color="#505050",
                       text_color=TEXT, command=self.export_history).grid(row=0, column=2, padx=(10, 0))
+        date_row = ctk.CTkFrame(filters, fg_color="transparent")
+        date_row.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
+        self.date_filter = ctk.CTkOptionMenu(
+            date_row, values=["Todas", "Hoy", "Últimos 7 días", "Últimos 30 días", "Personalizado"],
+            width=160, height=34, corner_radius=17, fg_color=SURFACE_2,
+            button_color=BORDER, command=lambda _: self.reset_history_search())
+        self.date_filter.pack(side="left", padx=(0, 8))
+        self.date_start = ctk.CTkEntry(date_row, placeholder_text="Desde AAAA-MM-DD", width=145, height=34)
+        self.date_start.pack(side="left", padx=(0, 6))
+        self.date_end = ctk.CTkEntry(date_row, placeholder_text="Hasta AAAA-MM-DD", width=145, height=34)
+        self.date_end.pack(side="left", padx=(0, 6))
+        for entry in (self.date_start, self.date_end):
+            entry.bind("<Return>", lambda _event: self.reset_history_search())
+        self.history_chart = Canvas(filters, bg=SURFACE, height=110, highlightthickness=0)
+        self.history_chart.grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 4))
+        self.history_chart.bind("<Configure>", lambda _event: self.render_history_chart())
         self.history_note = ctk.CTkLabel(
             filters, text="Cargando historial…", text_color=MUTED,
             font=ctk.CTkFont("Segoe UI", 11))
-        self.history_note.grid(row=2, column=0, sticky="w", padx=24, pady=(0, 8))
+        self.history_note.grid(row=4, column=0, sticky="w", padx=24, pady=(0, 8))
         self.history_full_list = ctk.CTkScrollableFrame(filters, fg_color="transparent")
-        self.history_full_list.grid(row=3, column=0, sticky="nsew", padx=17, pady=(0, 16))
+        self.history_full_list.grid(row=5, column=0, sticky="nsew", padx=17, pady=(0, 16))
         pager = ctk.CTkFrame(filters, fg_color="transparent")
-        pager.grid(row=4, column=0, sticky="e", padx=20, pady=(0, 16))
+        pager.grid(row=6, column=0, sticky="e", padx=20, pady=(0, 16))
         self.history_prev = ctk.CTkButton(pager, text="Anterior", width=95, height=30,
                                            corner_radius=16, fg_color=SURFACE_2,
                                            hover_color=BORDER, command=lambda: self.change_history_page(-1))
@@ -492,8 +521,26 @@ class SafeApp(ctk.CTk):
         self.history_next.pack(side="left")
 
         settings = self.pages["Configuración"]
+        settings.grid_rowconfigure(2, weight=0)
+        settings.grid_rowconfigure(3, weight=1)
+        diagnostic = self.card(settings)
+        diagnostic.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        diagnostic.grid_columnconfigure((0, 1, 2, 3, 4), weight=1)
+        self.diagnostic_labels = {}
+        self.diagnostic_cache = {}
+        for column, title in enumerate(("CÁMARA", "ROSTRO", "ESP32", "MG90S", "ACCESO")):
+            tile = ctk.CTkFrame(diagnostic, fg_color=SURFACE_2, corner_radius=11)
+            tile.grid(row=0, column=column, sticky="ew", padx=(12 if column == 0 else 4,
+                       12 if column == 4 else 4), pady=12)
+            ctk.CTkLabel(tile, text=title, text_color=MUTED,
+                         font=ctk.CTkFont("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+            label = ctk.CTkLabel(tile, text="INICIANDO", text_color=AMBER,
+                                 font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                                 anchor="w", wraplength=125)
+            label.pack(fill="x", padx=10, pady=(0, 8))
+            self.diagnostic_labels[title] = label
         settings_card = ctk.CTkScrollableFrame(settings, fg_color=SURFACE, corner_radius=16)
-        settings_card.grid(row=2, column=0, sticky="nsew")
+        settings_card.grid(row=3, column=0, sticky="nsew")
         settings_card.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(settings_card, text="Cámara y reconocimiento", text_color=TEXT,
                      font=ctk.CTkFont("Segoe UI", 18, "bold")).grid(
@@ -572,6 +619,10 @@ class SafeApp(ctk.CTk):
         ctk.CTkButton(admin_actions, text="Cerrar sesión", width=120, height=38,
                       corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
                       command=self.lock_admin_session).pack(side="left")
+        ctk.CTkButton(admin_actions, text="Crear respaldo local", width=160, height=38,
+                      corner_radius=20, fg_color=SURFACE_2, hover_color=BORDER,
+                      command=lambda: self.require_admin("Crear respaldo", self.choose_backup)).pack(
+                          side="left", padx=(8, 0))
 
     @staticmethod
     def setting_input(parent, row: int, title: str, value: str) -> ctk.CTkEntry:
@@ -626,6 +677,52 @@ class SafeApp(ctk.CTk):
             elif page == "Historial":
                 self.request_history()
 
+    def toggle_presentation(self) -> None:
+        self.presentation_mode = not self.presentation_mode
+        if self.presentation_mode:
+            self.navigate("Inicio")
+            self.navigation.grid_remove()
+            self.activity_card.grid_remove()
+            self.register_button.grid_remove()
+            self.dashboard_side.grid_rowconfigure(3, weight=0)
+            self.dashboard_body.grid_columnconfigure(0, weight=9)
+            self.dashboard_body.grid_columnconfigure(1, weight=3, minsize=320)
+            self.identity_title.configure(font=ctk.CTkFont("Segoe UI", 28, "bold"))
+            self.detail_label.configure(font=ctk.CTkFont("Segoe UI", 13))
+            self.presentation_button.configure(text="←  Vista normal")
+            self.page_title.configure(text="Demostración biométrica")
+        else:
+            self.navigation.grid()
+            self.activity_card.grid()
+            self.register_button.grid()
+            self.dashboard_side.grid_rowconfigure(3, weight=1)
+            self.identity_title.configure(font=ctk.CTkFont("Segoe UI", 20, "bold"))
+            self.detail_label.configure(font=ctk.CTkFont("Segoe UI", 10))
+            self.presentation_button.configure(text="◩  Presentación")
+            self.navigate("Inicio")
+            self.apply_responsive_layout()
+
+    def schedule_responsive_layout(self, event=None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        if self.resize_job is not None:
+            self.after_cancel(self.resize_job)
+        self.resize_job = self.after(120, self.apply_responsive_layout)
+
+    def apply_responsive_layout(self) -> None:
+        self.resize_job = None
+        if self.presentation_mode:
+            return
+        compact = self.winfo_width() < 1120
+        self.navigation.configure(width=175 if compact else 210)
+        if self.current_page == "Inicio":
+            self.dashboard_body.grid_columnconfigure(0, weight=6 if compact else 7)
+            self.dashboard_body.grid_columnconfigure(1, weight=4, minsize=320 if compact else 355)
+        if compact:
+            self.scan_result.grid_remove()
+        else:
+            self.scan_result.grid()
+
     def refresh_users(self) -> None:
         fingerprint = (tuple(self.people), frozenset(self.access_pin_ids))
         if fingerprint == self._rendered_users:
@@ -635,8 +732,9 @@ class SafeApp(ctk.CTk):
             child.destroy()
         if not self.people:
             ctk.CTkLabel(self.users_list,
-                         text="Aún no hay identidades. Registra el primer rostro para empezar.",
-                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
+                         text="◎  SIN IDENTIDADES\nRegistra el primer rostro para activar el acceso biométrico.",
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 14),
+                         justify="left").pack(
                 anchor="w", padx=12, pady=24)
             return
         for person_id, name, active in self.people:
@@ -664,10 +762,12 @@ class SafeApp(ctk.CTk):
                               text_color=BG,
                               command=lambda label=name: self.open_registration(label)).grid(
                     row=0, column=2, rowspan=2, padx=(4, 0))
-            ctk.CTkButton(item, text="PIN acceso", width=95, height=32,
+            missing_pin = person_id not in self.access_pin_ids
+            ctk.CTkButton(item, text="Completar PIN" if missing_pin else "PIN acceso", width=105, height=32,
                           corner_radius=17, fg_color=SURFACE, hover_color=BORDER,
                           text_color=TEXT, command=lambda uid=person_id, label=name:
-                          self.require_admin("PIN de acceso", lambda: self.set_access_pin(uid, label))).grid(
+                          self.require_admin("PIN de acceso", lambda: self.set_access_pin(uid, label,
+                                                                                    uid not in self.access_pin_ids))).grid(
                 row=0, column=3, rowspan=2, padx=(4, 0))
             ctk.CTkButton(item, text="Eliminar", width=95, height=32,
                           corner_radius=17, fg_color="#423035", hover_color="#653B44",
@@ -844,7 +944,10 @@ class SafeApp(ctk.CTk):
             self.submit_admin(lambda: self.admin.change(old_pin, new_pin), done, error, button)
         button.configure(command=submit)
 
-    def set_access_pin(self, person_id: str, name: str) -> None:
+    def set_access_pin(self, person_id: str, name: str, only_missing: bool = False) -> None:
+        if only_missing and person_id in self.access_pin_ids:
+            self.notify("El usuario ya tiene un PIN; no se sobrescribió", error=True)
+            return
         window = self.pin_window(f"PIN de acceso · {name}", 280)
         if window is None:
             return
@@ -862,7 +965,8 @@ class SafeApp(ctk.CTk):
             if pin != second.get() or not re.fullmatch(r"[0-9]{6,12}", pin):
                 hint.configure(text="Los PIN deben coincidir y tener 6 a 12 dígitos", text_color=RED)
                 return
-            self.backend.send("set_access_pin", (person_id, pin))
+            self.backend.send("complete_access_pin" if only_missing else "set_access_pin",
+                              (person_id, pin))
             self.close_pin_window()
         ctk.CTkButton(window, text="Guardar PIN", height=40, corner_radius=20,
                       fg_color=CYAN, hover_color="#1DB954", text_color=BG,
@@ -1011,6 +1115,68 @@ class SafeApp(ctk.CTk):
         if path:
             self.backend.send("export_history", Path(path))
 
+    def choose_backup(self) -> None:
+        name = f"safebox-respaldo-{datetime.now():%Y%m%d-%H%M%S}.zip"
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Guardar respaldo local sensible", initialfile=name,
+            defaultextension=".zip", filetypes=[("ZIP", "*.zip")])
+        if path:
+            self.backend.send("backup", Path(path))
+            self.notify("Creando respaldo local…")
+
+    def selected_history_dates(self) -> tuple[date | None, date | None]:
+        selected = self.date_filter.get()
+        today = datetime.now().astimezone().date()
+        if selected == "Hoy":
+            return today, today
+        if selected == "Últimos 7 días":
+            return today - timedelta(days=6), today
+        if selected == "Últimos 30 días":
+            return today - timedelta(days=29), today
+        if selected == "Personalizado":
+            start = date.fromisoformat(self.date_start.get().strip()) if self.date_start.get().strip() else None
+            end = date.fromisoformat(self.date_end.get().strip()) if self.date_end.get().strip() else None
+            if start and end and start > end:
+                raise ValueError("La fecha inicial debe ser anterior a la final")
+            if start is None and end is None:
+                raise ValueError("Indica al menos una fecha para el rango personalizado")
+            return start, end
+        return None, None
+
+    def render_history_chart(self) -> None:
+        chart = self.history_chart
+        chart.delete("all")
+        width = max(chart.winfo_width(), 100)
+        total, allowed, denied = getattr(self, "chart_stats", (0, 0, 0))
+        chart.create_text(4, 12, text=f"{total} INTENTOS  ·  {allowed} AUTORIZADOS  ·  {denied} DENEGADOS",
+                          anchor="w", fill=TEXT, font=("Segoe UI", 10, "bold"))
+        if not total:
+            chart.create_text(4, 67, text="Sin actividad registrada todavía", anchor="w",
+                              fill=MUTED, font=("Segoe UI", 11))
+            return
+        bar_width = max(100, min(270, width // 3))
+        chart.create_rectangle(4, 32, 4 + bar_width * allowed / total, 46, fill=CYAN, outline="")
+        chart.create_rectangle(4 + bar_width * allowed / total, 32, 4 + bar_width, 46,
+                               fill=RED, outline="")
+        chart.create_text(4, 55, text=f"{allowed / total:.1%} autorizados · {denied / total:.1%} denegados",
+                          anchor="nw", fill=MUTED, font=("Segoe UI", 9))
+        daily = self.daily_rows[-14:]
+        if daily:
+            start_x = bar_width + 34
+            chart_width = max(80, width - start_x - 10)
+            maximum = max(1, *(a + d for _, a, d in daily))
+            slot = chart_width / len(daily)
+            for index, (day, a, d) in enumerate(daily):
+                x = start_x + index * slot + 2
+                h_a, h_d = 54 * a / maximum, 54 * d / maximum
+                chart.create_rectangle(x, 88 - h_a, x + max(2, slot - 5), 88,
+                                       fill=CYAN, outline="")
+                chart.create_rectangle(x, 88 - h_a - h_d, x + max(2, slot - 5), 88 - h_a,
+                                       fill=RED, outline="")
+                if index in (0, len(daily) - 1):
+                    chart.create_text(x, 94, text=day[5:], anchor="nw", fill=MUTED,
+                                      font=("Segoe UI", 8))
+
     def schedule_history_search(self, _event=None) -> None:
         if self.search_job is not None:
             self.after_cancel(self.search_job)
@@ -1027,9 +1193,16 @@ class SafeApp(ctk.CTk):
     def request_history(self) -> None:
         self.search_job = None
         if self.backend_ready:
+            try:
+                self.history_dates = self.selected_history_dates()
+            except ValueError as exc:
+                self.history_note.configure(text=f"Fecha inválida: {exc}", text_color=RED)
+                return
+            self.history_note.configure(text_color=MUTED)
             self.history_note.configure(text="Buscando…")
             self.backend.send("search_history", (
-                self.history_search.get().strip(), self.history_filter.get(), self.history_offset))
+                self.history_search.get().strip(), self.history_filter.get(), self.history_offset,
+                *self.history_dates))
 
     def refresh_full_history(self) -> None:
         for child in self.history_full_list.winfo_children():
@@ -1041,8 +1214,9 @@ class SafeApp(ctk.CTk):
         self.history_next.configure(state="normal" if len(self.history_results) > 30 else "disabled")
         if not rows:
             ctk.CTkLabel(self.history_full_list,
-                         text="No hay intentos que coincidan con la búsqueda.",
-                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13)).pack(
+                         text="▤  SIN RESULTADOS\nAjusta los filtros o espera el primer intento de acceso.",
+                         text_color=MUTED, font=ctk.CTkFont("Segoe UI", 13),
+                         justify="left").pack(
                 anchor="w", padx=10, pady=22)
             return
         for date, user, result, distance, similarity, capture in rows:
@@ -1229,6 +1403,28 @@ class SafeApp(ctk.CTk):
             label.configure(text_color=color,
                             fg_color=GREEN_DIM if completed else SURFACE_2)
 
+    def refresh_diagnostics(self) -> None:
+        device = ("CONECTADO" if self.device_connected else "SIN RESPUESTA") if self.mode == "hardware" else (
+            "LED CONECTADO" if self.led_connected else "SIN RESPUESTA" if self.led_error_seen else
+            "CONECTANDO" if self.led_port else "SOLO SIM")
+        values = {
+            "CÁMARA": ("EN VIVO" if self.camera_connected else "SIN SEÑAL",
+                       CYAN if self.camera_connected else AMBER),
+            "ROSTRO": ("LISTO" if self.backend_ready else "ERROR" if self.status_state == "ERROR DE MODELO"
+                       else "CARGANDO", CYAN if self.backend_ready else RED if self.status_state == "ERROR DE MODELO" else AMBER),
+            "ESP32": (device, CYAN if self.device_connected or self.led_connected else
+                      RED if device == "SIN RESPUESTA" else AMBER),
+            "MG90S": (self.servo_status, CYAN if self.servo_status == "LISTO" else
+                      RED if self.servo_status == "ERROR" else AMBER),
+            "ACCESO": (f"{self.status_state or 'INICIANDO'} · {self.lock_state}",
+                       RED if self.lock_state == "ERROR" or self.status_state == "DENEGADO" else
+                       CYAN if self.status_state == "AUTORIZADO" else AMBER),
+        }
+        for title, value in values.items():
+            if self.diagnostic_cache.get(title) != value:
+                self.diagnostic_labels[title].configure(text=value[0], text_color=value[1])
+                self.diagnostic_cache[title] = value
+
     def finish_blue_led_indicator(self) -> None:
         self.led_off_job = None
         self.blue_led_until = 0.0
@@ -1354,7 +1550,7 @@ class SafeApp(ctk.CTk):
                      font=ctk.CTkFont("Segoe UI", 23, "bold")).grid(
             row=0, column=0, sticky="w", padx=28, pady=(25, 5)
         )
-        ctk.CTkLabel(window, text="Nombre y PIN · un rostro frente a la cámara · 20 muestras de captura.",
+        ctk.CTkLabel(window, text="Nombre y PIN · un rostro frente a la cámara · 20 muestras.\nBuena luz, mirada al frente y pequeños cambios de ángulo.",
                      text_color=MUTED, font=ctk.CTkFont("Segoe UI", 11),
                      wraplength=375, justify="left").grid(
             row=1, column=0, sticky="w", padx=28
@@ -1563,13 +1759,19 @@ class SafeApp(ctk.CTk):
                     self.request_history()
             elif kind == "stats":
                 total, allowed, denied, latest = event[1]
+                self.chart_stats = (total, allowed, denied)
+                self.render_history_chart()
                 last = latest[:19].replace("T", " ") if latest else "—"
                 self.stats_label.configure(text=f"Intentos {total}   ·   Autorizados {allowed}   ·   Denegados {denied}   ·   Último {last}")
+            elif kind == "daily_activity":
+                self.daily_rows = event[1]
+                self.render_history_chart()
             elif kind == "lock":
                 self.update_lock(event[1], event[2])
             elif kind == "device":
                 mode, port = event[1], event[2]
                 self.mode = mode
+                self.device_connected = mode == "hardware"
                 self.physical_unknown = event[3]
                 if mode == "hardware":
                     self.led_connected = False
@@ -1593,6 +1795,7 @@ class SafeApp(ctk.CTk):
                     self.commit_settings(values)
             elif kind == "device_error":
                 self.pending_settings = None
+                self.device_connected = False
                 self.physical_unknown = True
                 self.mode_badge.configure(text="●  HARDWARE · ERROR", text_color=RED)
                 self.settings_device.configure(text=event[1], text_color=RED)
@@ -1641,10 +1844,15 @@ class SafeApp(ctk.CTk):
                 self.notify(event[1], error=True)
             elif kind == "export_done":
                 self.notify(f"{event[1]} intentos exportados a CSV")
+            elif kind == "backup_done":
+                self.notify(f"Respaldo validado: {event[1]} · {event[2]} archivos. Contiene datos sensibles.")
+            elif kind == "backup_error":
+                self.notify(f"No se creó el respaldo: {event[1]}", error=True)
             elif kind == "history_search":
-                if (event[1], event[2], event[3]) == (self.history_search.get().strip(),
-                                                     self.history_filter.get(), self.history_offset):
-                    self.history_results = event[4]
+                if (event[1], event[2], event[3], event[4], event[5]) == (
+                        self.history_search.get().strip(), self.history_filter.get(),
+                        self.history_offset, *self.history_dates):
+                    self.history_results = event[6]
                     if self.current_page == "Historial":
                         self.refresh_full_history()
             elif kind == "users":
@@ -1690,6 +1898,9 @@ class SafeApp(ctk.CTk):
                     label = ("Guardando perfil SFace…" if event[1] >= SAMPLES_REQUIRED else
                              f"{event[1]} / {SAMPLES_REQUIRED} muestras · {round(event[1] / SAMPLES_REQUIRED * 100)} %")
                     self.enrollment_hint.configure(text=label)
+            elif kind == "enroll_hint":
+                if self.register_window is not None and self.register_window.winfo_exists():
+                    self.enrollment_hint.configure(text=event[1], text_color=AMBER)
             elif kind == "enroll_done":
                 self.known_users = event[2]
                 self.update_user_count()
@@ -1712,6 +1923,7 @@ class SafeApp(ctk.CTk):
                 self.notify(f"No se guardó el intento: {event[1]}", error=True)
             elif kind == "engine_error":
                 self.backend_ready = False
+                self.device_connected = False
                 self.set_state("ERROR DE MODELO", event[1])
                 self.settings_engine.configure(text=event[1], text_color=RED)
                 self.camera_badge.configure(text="●  RECONOCIMIENTO DETENIDO", text_color=RED)
@@ -1727,6 +1939,7 @@ class SafeApp(ctk.CTk):
                 if self.mode == "hardware":
                     self.mode_badge.configure(text="●  HARDWARE SIN CONEXIÓN", text_color=RED)
                 self.backend.stop()
+        self.refresh_diagnostics()
         if self.camera_connected and self.current_page in {"Inicio", "Escáner"}:
             latest = self.backend.latest_frame(self.last_frame_seq)
             if latest is not None:

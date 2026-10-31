@@ -8,11 +8,13 @@ import queue
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import cv2
@@ -26,6 +28,23 @@ YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 SFACE_FILE = "face_recognition_sface_2021dec_int8.onnx"
 DEFAULT_SIMILARITY_THRESHOLD = 0.5
 ENROLL_SAMPLES = 20
+
+
+def enrollment_quality(frame: np.ndarray, face: np.ndarray,
+                       feature: np.ndarray, samples: list[np.ndarray]) -> str | None:
+    """Descarta solo capturas claramente deficientes, sin tocar la identificación."""
+    x, y, width, height = (int(v) for v in face[:4])
+    crop = frame[max(0, y):max(0, y + height), max(0, x):max(0, x + width)]
+    if crop.size == 0:
+        return "Centra el rostro dentro de la cámara"
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) < 35:
+        return "Aumenta la iluminación del rostro"
+    if gray.shape[0] >= 40 and gray.shape[1] >= 40 and cv2.Laplacian(gray, cv2.CV_64F).var() < 18:
+        return "Mantén el rostro quieto y enfocado"
+    if samples and float(np.dot(feature, samples[-1])) > 0.99995:
+        return "Mueve ligeramente el rostro para variar la muestra"
+    return None
 
 
 def load_models(model_dir: Path = MODEL_DIR):
@@ -279,13 +298,20 @@ class AccessHistory:
         ).fetchall()
 
     def search(self, user: str = "", result: str = "Todos", limit: int = 31,
-               offset: int = 0) -> list[tuple]:
+               offset: int = 0, start: date | None = None,
+               end: date | None = None) -> list[tuple]:
+        if start and end and start > end:
+            raise ValueError("La fecha inicial debe ser anterior a la final")
         pattern = "%" + user.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         return self.db.execute(
             "SELECT fecha, usuario, resultado, distancia, similitud, captura FROM accesos "
             "WHERE usuario LIKE ? ESCAPE '\\' AND (? = 'Todos' OR resultado = ?) "
+            "AND (? IS NULL OR substr(fecha,1,10) >= ?) "
+            "AND (? IS NULL OR substr(fecha,1,10) <= ?) "
             "ORDER BY id DESC LIMIT ? OFFSET ?",
-            (pattern, result, result, limit, offset),
+            (pattern, result, result, start.isoformat() if start else None,
+             start.isoformat() if start else None, end.isoformat() if end else None,
+             end.isoformat() if end else None, limit, offset),
         ).fetchall()
 
     def stats(self) -> tuple[int, int, int, str | None]:
@@ -294,6 +320,13 @@ class AccessHistory:
             "COALESCE(SUM(resultado='DENEGADO'),0), MAX(fecha) FROM accesos"
         ).fetchone()
         return int(total), int(allowed), int(denied), latest
+
+    def daily_activity(self, limit: int = 14) -> list[tuple[str, int, int]]:
+        return [(day, int(allowed), int(denied)) for day, allowed, denied in self.db.execute(
+            "SELECT substr(fecha,1,10), SUM(resultado='AUTORIZADO'), "
+            "SUM(resultado='DENEGADO') FROM accesos "
+            "GROUP BY substr(fecha,1,10) ORDER BY 1 DESC LIMIT ?", (limit,)
+        ).fetchall()][::-1]
 
     def export_csv(self, path: Path) -> int:
         rows = self.db.execute(
@@ -310,6 +343,52 @@ class AccessHistory:
 
     def close(self) -> None:
         self.db.close()
+
+
+def create_local_backup(root: Path, destination: Path, history: AccessHistory) -> tuple[Path, int]:
+    """Crea un ZIP íntegro usando una instantánea SQLite; nunca altera el origen."""
+    root = root.resolve()
+    destination = destination.resolve()
+    if destination == root or root in destination.parents:
+        raise ValueError("Selecciona un destino fuera de la carpeta de datos")
+    if destination.exists():
+        raise FileExistsError("El archivo de respaldo ya existe")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    if temporary.exists():
+        raise FileExistsError("Ya existe un respaldo temporal con ese nombre")
+    count = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix="safebox-backup-") as scratch:
+            snapshot = Path(scratch) / "historial.db"
+            target = sqlite3.connect(snapshot)
+            try:
+                history.db.backup(target)
+            finally:
+                target.close()
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.write(snapshot, "historial.db")
+                count += 1
+                for name in ("usuarios.json", "admin.json", "access_pins.json", "config.json"):
+                    source = root / name
+                    if source.is_file():
+                        archive.write(source, name)
+                        count += 1
+                for dirname in ("rostros", "rasgos_sface", "capturas"):
+                    folder = root / dirname
+                    if folder.is_dir():
+                        for source in folder.rglob("*"):
+                            if source.is_file() and not source.is_symlink():
+                                archive.write(source, source.relative_to(root).as_posix())
+                                count += 1
+        with zipfile.ZipFile(temporary) as archive:
+            if archive.testzip() is not None or "historial.db" not in archive.namelist():
+                raise OSError("El respaldo no superó la comprobación de integridad")
+        temporary.replace(destination)
+        return destination, count
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class CommandBridge:
@@ -605,18 +684,17 @@ class SafeBackend:
 
     def _camera_loop(self) -> None:
         capture = None
-        open_requested = True
+        retry_delay = 0.5
         try:
             while not self.stop_event.is_set():
                 if capture is None:
-                    if not open_requested:
-                        try:
-                            camera_command = self.camera_commands.get(timeout=0.2)
-                            if isinstance(camera_command, tuple) and camera_command[0] == "switch":
-                                self.camera_index = camera_command[1]
-                        except queue.Empty:
-                            continue
-                    open_requested = False
+                    try:
+                        camera_command = self.camera_commands.get_nowait()
+                        if isinstance(camera_command, tuple) and camera_command[0] == "switch":
+                            self.camera_index = camera_command[1]
+                            retry_delay = 0.5
+                    except queue.Empty:
+                        pass
                     if self.stop_event.is_set():
                         break
                     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
@@ -624,9 +702,17 @@ class SafeBackend:
                     if not candidate.isOpened():
                         candidate.release()
                         self.camera_connected = False
-                        self.events.put(("camera", False, f"Cámara {self.camera_index} no disponible"))
+                        self.events.put(("camera", False, f"Cámara {self.camera_index} no disponible · reintento en {retry_delay:g} s"))
+                        try:
+                            camera_command = self.camera_commands.get(timeout=retry_delay)
+                            if isinstance(camera_command, tuple) and camera_command[0] == "switch":
+                                self.camera_index = camera_command[1]
+                            retry_delay = 0.5
+                        except queue.Empty:
+                            retry_delay = min(retry_delay * 2, 8.0)
                         continue
                     capture = candidate
+                    retry_delay = 0.5
                     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -642,7 +728,7 @@ class SafeBackend:
                     capture = None
                     self.camera_connected = False
                     self.events.put(("camera", False, "Cambiando cámara…"))
-                    open_requested = True
+                    retry_delay = 0.5
                     continue
                 read_started = time.monotonic()
                 ok, frame = capture.read()
@@ -651,6 +737,13 @@ class SafeBackend:
                     capture = None
                     self.camera_connected = False
                     self.events.put(("camera", False, "No se pudo leer la cámara"))
+                    try:
+                        camera_command = self.camera_commands.get(timeout=retry_delay)
+                        if isinstance(camera_command, tuple) and camera_command[0] == "switch":
+                            self.camera_index = camera_command[1]
+                        retry_delay = 0.5
+                    except queue.Empty:
+                        retry_delay = min(retry_delay * 2, 8.0)
                     continue
                 frame = cv2.flip(frame, 1)
                 with self.frame_lock:
@@ -749,6 +842,7 @@ class SafeBackend:
                 history.record(user, result, similarity, frame)
                 self.events.put(("history", history.recent()))
                 self.events.put(("stats", history.stats()))
+                self.events.put(("daily_activity", history.daily_activity()))
             except (OSError, sqlite3.Error) as exc:
                 self.events.put(("storage_error", str(exc)))
 
@@ -790,6 +884,7 @@ class SafeBackend:
             self.events.put(("ready", list(store.users.values()), history.recent(), store.list_people()))
             self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
+            self.events.put(("daily_activity", history.daily_activity()))
             publish_lock()
             while not self.stop_event.is_set():
                 if (self.mode == "hardware" and bridge is not None and
@@ -861,6 +956,18 @@ class SafeBackend:
                             self.events.put(("pin_set", store.users[person_id]))
                         except (OSError, ValueError) as exc:
                             self.events.put(("user_error", str(exc)))
+                    elif kind == "complete_access_pin":
+                        person_id, access_pin = value
+                        try:
+                            if person_id not in store.users:
+                                raise ValueError("El usuario ya no existe")
+                            if pin_store.has_pin(person_id):
+                                raise ValueError("El usuario ya tiene PIN; no se sobrescribió")
+                            pin_store.set_pin(person_id, access_pin)
+                            self.events.put(("pins", pin_store.ids()))
+                            self.events.put(("pin_set", store.users[person_id]))
+                        except (OSError, ValueError) as exc:
+                            self.events.put(("user_error", str(exc)))
                     elif kind == "cancel_access":
                         end_pending("Verificación cancelada")
                     elif kind == "access_pin":
@@ -912,10 +1019,11 @@ class SafeBackend:
                         publish_lock()
                     elif kind == "search_history":
                         try:
-                            user, result, offset = value
-                            self.events.put(("history_search", user, result, offset,
-                                             history.search(user, result, offset=offset)))
-                        except sqlite3.Error as exc:
+                            user, result, offset, start, end = value
+                            self.events.put(("history_search", user, result, offset, start, end,
+                                             history.search(user, result, offset=offset,
+                                                            start=start, end=end)))
+                        except (sqlite3.Error, ValueError) as exc:
                             self.events.put(("storage_error", str(exc)))
                     elif kind == "admin_ready":
                         self.admin_ready = bool(value)
@@ -1024,6 +1132,13 @@ class SafeBackend:
                                 self.events.put(("configuration_error", str(exc)))
                     elif kind == "stats":
                         self.events.put(("stats", history.stats()))
+                        self.events.put(("daily_activity", history.daily_activity()))
+                    elif kind == "backup":
+                        try:
+                            destination, count = create_local_backup(self.data_dir, Path(value), history)
+                            self.events.put(("backup_done", str(destination), count))
+                        except (OSError, ValueError, sqlite3.Error, zipfile.BadZipFile) as exc:
+                            self.events.put(("backup_error", str(exc)))
                     elif kind == "export_history":
                         try:
                             count = history.export_csv(Path(value))
@@ -1092,9 +1207,13 @@ class SafeBackend:
                     tracker.update([])
                     face_labels = []
                     if now - last_sample >= 0.25:
-                        samples.append(feature)
-                        last_sample = now
-                        self.events.put(("enroll_progress", len(samples)))
+                        warning = enrollment_quality(frame, found[0], feature, samples)
+                        if warning:
+                            self.events.put(("enroll_hint", warning))
+                        else:
+                            samples.append(feature)
+                            last_sample = now
+                            self.events.put(("enroll_progress", len(samples)))
                     state("REGISTRANDO", f"Capturando · {len(samples)}/{ENROLL_SAMPLES}", enrolling_name, boxes=boxes)
                     if len(samples) >= ENROLL_SAMPLES:
                         name = enrolling_name
