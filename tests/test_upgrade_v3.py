@@ -35,7 +35,8 @@ class UpgradeV3Tests(unittest.TestCase):
             commands.get_nowait.side_effect = queue.Empty
             commands.get.side_effect = waiting
             backend.camera_commands = commands
-            with patch.object(core.cv2, "VideoCapture", return_value=candidate) as opened:
+            with (patch.object(core.sys, "platform", "linux"),
+                  patch.object(core.cv2, "VideoCapture", return_value=candidate) as opened):
                 backend._camera_loop()
             self.assertEqual(waits, [0.5, 1.0, 2.0, 4.0])
             self.assertEqual(opened.call_count, 4)

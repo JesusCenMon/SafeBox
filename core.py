@@ -780,6 +780,9 @@ class SafeBackend:
         self.frame: np.ndarray | None = None
         self.frame_seq = 0
         self.camera_connected = False
+        self.capture_active = threading.Event()
+        self.capture_active.set()
+        self.camera_paused = False
         self._last_camera_retry = 0.0
         self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True, name="safebox-camera")
         self.engine_thread = threading.Thread(target=self._engine_loop, daemon=True, name="safebox-engine")
@@ -792,9 +795,18 @@ class SafeBackend:
 
     def latest_frame(self, after_seq: int) -> tuple[int, np.ndarray] | None:
         with self.frame_lock:
-            if self.frame is None or self.frame_seq == after_seq:
+            if not self.capture_active.is_set() or self.frame is None or self.frame_seq == after_seq:
                 return None
             return self.frame_seq, self.frame
+
+    def set_capture_active(self, active: bool) -> None:
+        if active == self.capture_active.is_set():
+            return
+        if active:
+            self.capture_active.set()
+        else:
+            self.capture_active.clear()
+        self.camera_commands.put("wake")
 
     def send(self, kind: str, value=None) -> None:
         self.commands.put((kind, value))
@@ -824,70 +836,123 @@ class SafeBackend:
     def _camera_loop(self) -> None:
         capture = None
         retry_delay = 0.5
+        backends = ([cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32"
+                    else [cv2.CAP_ANY])
+        preferred = 0
+
+        def apply_command(command) -> None:
+            nonlocal preferred, retry_delay
+            if isinstance(command, tuple) and command[0] == "switch":
+                self.camera_index = command[1]
+                preferred = 0
+                retry_delay = 0.5
+            elif command == "retry":
+                retry_delay = 0.5
+
+        def wait_retry() -> None:
+            nonlocal retry_delay
+            try:
+                apply_command(self.camera_commands.get(timeout=retry_delay))
+            except queue.Empty:
+                retry_delay = min(retry_delay * 2, 8.0)
+
         try:
             while not self.stop_event.is_set():
+                if not self.capture_active.is_set():
+                    if capture is not None:
+                        capture.release()
+                        capture = None
+                    self.camera_connected = False
+                    with self.frame_lock:
+                        self.frame = None
+                    if not self.camera_paused:
+                        self.camera_paused = True
+                        self.events.put(("camera_paused", True))
+                    try:
+                        apply_command(self.camera_commands.get(timeout=0.2))
+                    except queue.Empty:
+                        pass
+                    continue
+                if self.camera_paused:
+                    self.camera_paused = False
+                    self.events.put(("camera_paused", False))
                 if capture is None:
                     try:
-                        camera_command = self.camera_commands.get_nowait()
-                        if isinstance(camera_command, tuple) and camera_command[0] == "switch":
-                            self.camera_index = camera_command[1]
-                            retry_delay = 0.5
+                        apply_command(self.camera_commands.get_nowait())
                     except queue.Empty:
                         pass
                     if self.stop_event.is_set():
                         break
-                    backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-                    candidate = cv2.VideoCapture(self.camera_index, backend)
-                    if not candidate.isOpened():
-                        candidate.release()
-                        self.camera_connected = False
-                        self.events.put(("camera", False, f"Cámara {self.camera_index} no disponible · reintento en {retry_delay:g} s"))
+                    errors = []
+                    for backend in backends[preferred:]:
+                        candidate = None
                         try:
-                            camera_command = self.camera_commands.get(timeout=retry_delay)
-                            if isinstance(camera_command, tuple) and camera_command[0] == "switch":
-                                self.camera_index = camera_command[1]
-                            retry_delay = 0.5
-                        except queue.Empty:
-                            retry_delay = min(retry_delay * 2, 8.0)
+                            candidate = cv2.VideoCapture(self.camera_index, backend)
+                            if candidate.isOpened():
+                                capture = candidate
+                                preferred = backends.index(backend)
+                                break
+                            errors.append("no se abrió")
+                        except (cv2.error, OSError) as exc:
+                            errors.append(f"OpenCV: {exc}")
+                        if candidate is not None:
+                            candidate.release()
+                    if capture is None:
+                        self.camera_connected = False
+                        self.events.put(("camera", False,
+                                         f"Cámara {self.camera_index}: {errors[-1] if errors else 'no disponible'}; "
+                                         f"revisa permisos, conexión o si otra app la usa · reintento en {retry_delay:g} s"))
+                        preferred = 0
+                        wait_retry()
                         continue
-                    capture = candidate
                     retry_delay = 0.5
-                    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    self.camera_connected = True
-                    self.events.put(("camera", True, ""))
+                    for prop, value in ((cv2.CAP_PROP_FRAME_WIDTH, 640),
+                                        (cv2.CAP_PROP_FRAME_HEIGHT, 480),
+                                        (cv2.CAP_PROP_BUFFERSIZE, 1)):
+                        try:
+                            capture.set(prop, value)
+                        except cv2.error:
+                            pass
                 try:
                     camera_command = self.camera_commands.get_nowait()
                 except queue.Empty:
                     camera_command = None
                 if isinstance(camera_command, tuple) and camera_command[0] == "switch":
-                    self.camera_index = camera_command[1]
+                    apply_command(camera_command)
                     capture.release()
                     capture = None
                     self.camera_connected = False
+                    with self.frame_lock:
+                        self.frame = None
                     self.events.put(("camera", False, "Cambiando cámara…"))
-                    retry_delay = 0.5
                     continue
                 read_started = time.monotonic()
-                ok, frame = capture.read()
-                if not ok:
+                try:
+                    ok, frame = capture.read()
+                except (cv2.error, OSError) as exc:
+                    ok, frame = False, None
+                    error = f"OpenCV no pudo leer la cámara: {exc}"
+                else:
+                    error = "No se pudo leer un fotograma válido de la cámara"
+                if (not ok or frame is None or not isinstance(frame, np.ndarray) or
+                        frame.ndim != 3 or frame.shape[2] != 3 or frame.dtype != np.uint8 or frame.size == 0):
                     capture.release()
                     capture = None
                     self.camera_connected = False
-                    self.events.put(("camera", False, "No se pudo leer la cámara"))
-                    try:
-                        camera_command = self.camera_commands.get(timeout=retry_delay)
-                        if isinstance(camera_command, tuple) and camera_command[0] == "switch":
-                            self.camera_index = camera_command[1]
-                        retry_delay = 0.5
-                    except queue.Empty:
-                        retry_delay = min(retry_delay * 2, 8.0)
+                    with self.frame_lock:
+                        self.frame = None
+                    self.events.put(("camera", False, error))
+                    if preferred == 0 and len(backends) > 1:
+                        preferred = 1
+                    wait_retry()
                     continue
                 frame = cv2.flip(frame, 1)
                 with self.frame_lock:
                     self.frame = frame
                     self.frame_seq += 1
+                if not self.camera_connected:
+                    self.camera_connected = True
+                    self.events.put(("camera", True, ""))
                 self.stop_event.wait(max(0.0, 1 / 30 - (time.monotonic() - read_started)))
         except Exception as exc:
             self.camera_connected = False
@@ -1299,7 +1364,28 @@ class SafeBackend:
                         break
                 if self.stop_event.is_set():
                     break
+                if not self.capture_active.is_set():
+                    tracker.update([])
+                    face_labels = []
+                    candidate_name, streak = None, 0
+                    authorized_id = None
+                    last_verified_id = None
+                    prompted_id = None
+                    last_seq = self.frame_seq
+                    if pending_access is not None:
+                        pending_access = None
+                        pin_rejected = False
+                        self.events.put(("pin_expired", "Verificación pausada"))
+                    self.stop_event.wait(0.06)
+                    continue
                 if not self.camera_connected:
+                    if enrolling_name is not None:
+                        enrolling_name = None
+                        enrolling_pin = None
+                        samples = []
+                        last_sample = 0.0
+                        self.events.put(("enroll_progress", 0))
+                        self.events.put(("enroll_error", "Cámara interrumpida; reintenta el registro al recuperar imagen"))
                     tracker.update([])
                     face_labels = []
                     candidate_name, streak = None, 0
