@@ -14,7 +14,7 @@ class IconProvider:
         self._unavailable = False
 
     def pillow(self, name: str, size: int = 20, color: str = "#FFFFFF",
-               stroke_width: float = 1.8):
+               stroke_width: float = 2.2):
         key = (name, size, color, stroke_width)
         if key in self._pil:
             self._pil.move_to_end(key)
@@ -39,7 +39,7 @@ class IconProvider:
         return picture
 
     def ctk_image(self, name: str, size: int = 20, color: str = "#FFFFFF",
-                  stroke_width: float = 1.8):
+                  stroke_width: float = 2.2):
         key = (name, size, color, stroke_width)
         if key in self._tk:
             self._tk.move_to_end(key)
