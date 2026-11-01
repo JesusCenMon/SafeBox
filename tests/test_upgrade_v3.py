@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import core
+import app
 from control import AccessPinStore
 
 
@@ -138,6 +139,7 @@ class UpgradeV3Tests(unittest.TestCase):
                     self.assertFalse(any(name.endswith(".py") for name in archive.namelist()))
                     snapshot = Path(directory) / "snapshot.db"
                     snapshot.write_bytes(archive.read("historial.db"))
+                self.assertEqual(core.verify_local_backup(path), (True, []))
                 db = sqlite3.connect(snapshot)
                 try:
                     self.assertEqual(db.execute("SELECT COUNT(*) FROM accesos").fetchone()[0], 1)
@@ -147,6 +149,64 @@ class UpgradeV3Tests(unittest.TestCase):
                     core.create_local_backup(root, destination, history)
             finally:
                 history.close()
+
+    def test_filtered_export_uses_all_matching_pages_without_photos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = core.AccessHistory(root)
+            try:
+                history.db.executemany(
+                    "INSERT INTO accesos (fecha,usuario,resultado,captura) VALUES (?,?,?,?)",
+                    [("2026-10-10T10:00:00-05:00", "Ana", "AUTORIZADO", "secret.jpg") for _ in range(501)] +
+                    [("2026-10-11T10:00:00-05:00", "Beto", "DENEGADO", "other.jpg")])
+                history.db.commit()
+                target = root / "filtered.csv"
+                count = history.export_filtered_csv(target, "Ana", "AUTORIZADO",
+                                                    date(2026, 10, 10), date(2026, 10, 10))
+                self.assertEqual(count, 501)
+                content = target.read_text(encoding="utf-8-sig")
+                self.assertEqual(len(content.splitlines()), 502)
+                self.assertNotIn("secret.jpg", content)
+                self.assertNotIn("Beto", content)
+                with self.assertRaises(FileExistsError):
+                    history.export_filtered_csv(target)
+            finally:
+                history.close()
+
+    def test_graph_png_uses_real_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "charts.png"
+            app.save_graphs_png(path, (3, 2, 1), [("2026-10-10", 2, 1)],
+                                [("2026-10-10", 8, 3)])
+            from PIL import Image
+            with Image.open(path) as picture:
+                self.assertEqual(picture.format, "PNG")
+                self.assertEqual(picture.size, (1050, 430))
+
+    def test_integrity_and_storage_are_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "usuarios.json").write_text('{"1":"Ana"}', encoding="utf-8")
+            (root / "access_pins.json").write_text('{}', encoding="utf-8")
+            (root / "config.json").write_text('{}', encoding="utf-8")
+            (root / "historial.db").write_bytes(b"damaged")
+            before = {path.name: path.read_bytes() for path in root.iterdir()}
+            findings = core.check_data_integrity(root)
+            self.assertTrue(any("rostro sin PIN" in finding for finding in findings))
+            self.assertTrue(any("historial.db" in finding for finding in findings))
+            self.assertTrue(any("config.json" in finding for finding in findings))
+            sizes = core.storage_sizes(root)
+            self.assertGreater(sizes["historial"], 0)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in root.iterdir()})
+
+    def test_backup_verifier_reports_corrupt_or_incomplete_zip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "incomplete.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("notes.txt", "x")
+            valid, findings = core.verify_local_backup(path)
+            self.assertFalse(valid)
+            self.assertTrue(any("historial.db" in finding for finding in findings))
 
 
 if __name__ == "__main__":

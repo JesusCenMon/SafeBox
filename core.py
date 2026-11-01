@@ -14,7 +14,7 @@ import time
 import uuid
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import cv2
@@ -328,6 +328,38 @@ class AccessHistory:
             "GROUP BY substr(fecha,1,10) ORDER BY 1 DESC LIMIT ?", (limit,)
         ).fetchall()][::-1]
 
+    def hourly_activity(self, days: int = 7) -> list[tuple[str, int, int]]:
+        """Agrupa por la fecha y hora locales conservadas en cada registro."""
+        since = (datetime.now().astimezone().date() - timedelta(days=days - 1)).isoformat()
+        return [(day, int(hour), int(count)) for day, hour, count in self.db.execute(
+            "SELECT substr(fecha,1,10), substr(fecha,12,2), COUNT(*) FROM accesos "
+            "WHERE substr(fecha,1,10) >= ? GROUP BY 1,2 ORDER BY 1,2", (since,)
+        ).fetchall()]
+
+    def export_filtered_csv(self, path: Path, user: str = "", result: str = "Todos",
+                            start: date | None = None, end: date | None = None) -> int:
+        """Exporta todos los resultados de la consulta, independientemente de la página visible."""
+        if path.exists():
+            raise FileExistsError("El CSV ya existe; elige otro nombre")
+        count = 0
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            with temporary.open("w", encoding="utf-8-sig", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(("fecha", "usuario", "resultado", "distancia_lbph", "similitud_sface"))
+                while True:
+                    rows = self.search(user, result, limit=500, offset=count, start=start, end=end)
+                    for row in rows:
+                        writer.writerow(row[:5])
+                    count += len(rows)
+                    if len(rows) < 500:
+                        break
+            temporary.replace(path)
+            return count
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
     def export_csv(self, path: Path) -> int:
         rows = self.db.execute(
             "SELECT fecha, usuario, resultado, distancia, similitud FROM accesos ORDER BY id DESC"
@@ -381,6 +413,9 @@ def create_local_backup(root: Path, destination: Path, history: AccessHistory) -
                             if source.is_file() and not source.is_symlink():
                                 archive.write(source, source.relative_to(root).as_posix())
                                 count += 1
+                contents = archive.namelist()
+                archive.writestr("manifest.json", json.dumps({"files": contents}, ensure_ascii=False))
+                count += 1
         with zipfile.ZipFile(temporary) as archive:
             if archive.testzip() is not None or "historial.db" not in archive.namelist():
                 raise OSError("El respaldo no superó la comprobación de integridad")
@@ -389,6 +424,110 @@ def create_local_backup(root: Path, destination: Path, history: AccessHistory) -
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+
+
+def verify_local_backup(path: Path) -> tuple[bool, list[str]]:
+    """Comprueba estructura y CRC del ZIP sin restaurar ni modificar datos."""
+    findings = []
+    if not path.is_file() or path.stat().st_size == 0:
+        return False, ["El archivo ZIP no existe o está vacío"]
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if not names or "historial.db" not in names:
+                findings.append("Falta la instantánea historial.db")
+            if "manifest.json" in names:
+                try:
+                    expected = json.loads(archive.read("manifest.json"))["files"]
+                    if not isinstance(expected, list) or any(name not in names for name in expected):
+                        findings.append("Faltan archivos declarados en el manifiesto")
+                except (ValueError, KeyError, TypeError):
+                    findings.append("El manifiesto del respaldo no es legible")
+            bad = archive.testzip()
+            if bad:
+                findings.append(f"Archivo dañado dentro del ZIP: {bad}")
+            if "historial.db" in names and not archive.getinfo("historial.db").file_size:
+                findings.append("La instantánea SQLite está vacía")
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        findings.append(f"No se puede leer el ZIP: {exc}")
+    return not findings, findings
+
+
+def check_data_integrity(root: Path) -> list[str]:
+    """Diagnóstico de solo lectura; nunca crea archivos ni repara registros."""
+    findings = []
+    def read_object(name: str) -> dict | None:
+        path = root / name
+        if not path.is_file():
+            findings.append(f"Falta {name}; comprueba el respaldo local")
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("se esperaba un objeto JSON")
+            return value
+        except (OSError, ValueError) as exc:
+            findings.append(f"{name} no es legible: {exc}")
+            return None
+
+    users = read_object("usuarios.json")
+    pins = read_object("access_pins.json")
+    config = read_object("config.json")
+    admin = read_object("admin.json")
+    if admin is not None and not {"salt", "hash"}.issubset(admin):
+        findings.append("admin.json está incompleto; consulta un respaldo válido")
+    if config is not None:
+        for key in ("camera_index", "similarity_threshold", "authorization_seconds", "mode", "port"):
+            if key not in config:
+                findings.append(f"config.json no contiene {key}; revisa Configuración")
+    if users is not None:
+        for person_id, name in users.items():
+            if not isinstance(person_id, str) or not person_id.isdecimal() or not isinstance(name, str):
+                findings.append("usuarios.json contiene un registro inválido")
+                continue
+            if not (root / "rasgos_sface" / f"{person_id}.npy").is_file():
+                findings.append(f"{name}: falta perfil SFace; puede requerir reenrolamiento")
+            if pins is not None and person_id not in pins:
+                findings.append(f"{name}: rostro sin PIN; completa el perfil en Usuarios")
+        if pins is not None:
+            for person_id, record in pins.items():
+                if person_id not in users:
+                    findings.append(f"PIN huérfano para ID {person_id}; revisa el respaldo")
+                if not isinstance(record, dict) or not {"salt", "hash"}.issubset(record):
+                    findings.append(f"Registro de PIN incompleto para ID {person_id}")
+    database = root / "historial.db"
+    if not database.is_file():
+        findings.append("Falta historial.db; revisa el respaldo local")
+    else:
+        try:
+            connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+            try:
+                result = connection.execute("PRAGMA quick_check").fetchone()
+                if result is None or result[0] != "ok":
+                    findings.append("historial.db no superó la comprobación SQLite")
+                connection.execute("SELECT COUNT(*) FROM accesos").fetchone()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error) as exc:
+            findings.append(f"historial.db no se puede consultar: {exc}")
+    return findings
+
+
+def storage_sizes(root: Path, backup_paths: list[Path] | None = None) -> dict[str, int]:
+    """Espacio ocupado por datos conocidos; respaldos solo de rutas conocidas de esta sesión."""
+    def size(path: Path) -> int:
+        if path.is_file():
+            return path.stat().st_size
+        if path.is_dir():
+            return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+        return 0
+    return {
+        "capturas": size(root / "capturas"),
+        "historial": size(root / "historial.db"),
+        "perfiles": size(root / "rasgos_sface") + size(root / "rostros") + size(root / "usuarios.json"),
+        "configuración y PIN": sum(size(root / name) for name in ("config.json", "admin.json", "access_pins.json")),
+        "respaldos de esta sesión": sum(size(path) for path in backup_paths or []),
+    }
 
 
 class CommandBridge:
@@ -840,9 +979,11 @@ class SafeBackend:
                            frame: np.ndarray) -> None:
             try:
                 history.record(user, result, similarity, frame)
+                self.events.put(("access_recorded", user, result))
                 self.events.put(("history", history.recent()))
                 self.events.put(("stats", history.stats()))
                 self.events.put(("daily_activity", history.daily_activity()))
+                self.events.put(("hourly_activity", history.hourly_activity()))
             except (OSError, sqlite3.Error) as exc:
                 self.events.put(("storage_error", str(exc)))
 
@@ -885,6 +1026,7 @@ class SafeBackend:
             self.events.put(("pins", pin_store.ids()))
             self.events.put(("stats", history.stats()))
             self.events.put(("daily_activity", history.daily_activity()))
+            self.events.put(("hourly_activity", history.hourly_activity()))
             publish_lock()
             while not self.stop_event.is_set():
                 if (self.mode == "hardware" and bridge is not None and
@@ -1133,6 +1275,14 @@ class SafeBackend:
                     elif kind == "stats":
                         self.events.put(("stats", history.stats()))
                         self.events.put(("daily_activity", history.daily_activity()))
+                        self.events.put(("hourly_activity", history.hourly_activity()))
+                    elif kind == "export_filtered_history":
+                        try:
+                            path, user, result, start, end = value
+                            count = history.export_filtered_csv(Path(path), user, result, start, end)
+                            self.events.put(("export_filtered_done", count, str(path)))
+                        except (OSError, ValueError, sqlite3.Error) as exc:
+                            self.events.put(("export_filtered_error", str(exc)))
                     elif kind == "backup":
                         try:
                             destination, count = create_local_backup(self.data_dir, Path(value), history)
